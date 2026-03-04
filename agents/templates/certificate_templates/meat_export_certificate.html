@@ -1,0 +1,613 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Halal Export Certificate - Meat</title>
+    <style>
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+
+      @page {
+        size: A4;
+        margin: 0;
+      }
+
+      body {
+        font-family: "Georgia", "Times New Roman", serif;
+        background-color: #ffffff;
+        padding: 0;
+        margin: 0;
+      }
+
+      .certificate-container {
+        width: 210mm;
+        height: 297mm;
+        margin: 0 auto;
+        background: #ffffff;
+        border: 6px solid #0a2b20;
+        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.1);
+        padding: 10mm;
+        position: relative;
+        overflow: hidden;
+        page-break-inside: avoid;
+      }
+
+      .certificate-container::before {
+        content: "";
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background-image: url("HCO-Logo.png");
+        background-repeat: no-repeat;
+        background-position: center;
+        background-size: 65% auto;
+        opacity: 0.13;
+        pointer-events: none;
+        z-index: 0;
+      }
+
+      /* Decorative corner elements */
+      .corner-decoration {
+        position: absolute;
+        width: 60px;
+        height: 60px;
+        border: 2px solid #90c850;
+      }
+
+      .corner-decoration.top-left {
+        top: 15px;
+        left: 15px;
+        border-right: none;
+        border-bottom: none;
+      }
+
+      .corner-decoration.top-right {
+        top: 15px;
+        right: 15px;
+        border-left: none;
+        border-bottom: none;
+      }
+
+      .corner-decoration.bottom-left {
+        bottom: 15px;
+        left: 15px;
+        border-right: none;
+        border-top: none;
+      }
+
+      .corner-decoration.bottom-right {
+        bottom: 15px;
+        right: 15px;
+        border-left: none;
+        border-top: none;
+      }
+
+      /* Subtle pattern overlay */
+      .pattern-overlay {
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        opacity: 0.015;
+        background-image: repeating-linear-gradient(
+          45deg,
+          transparent,
+          transparent 40px,
+          #1a4d3a 40px,
+          #1a4d3a 41px
+        );
+        pointer-events: none;
+      }
+
+      .content-wrapper {
+        position: relative;
+        z-index: 1;
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+      }
+
+      .main-content {
+        flex: 0 0 auto;
+      }
+
+      .header {
+        text-align: center;
+        margin-bottom: 15px;
+        padding-bottom: 15px;
+        border-bottom: 3px solid #0a2b20;
+      }
+
+      .logo-container {
+        display: inline-block;
+        margin-bottom: 10px;
+      }
+
+      .hco-logo {
+        width: auto;
+        height: 85px;
+        display: block;
+      }
+
+      .main-title {
+        font-size: 38px;
+        font-weight: 500;
+        color: #1a4d3a;
+        letter-spacing: 4px;
+        text-transform: uppercase;
+        font-family: "Georgia", serif;
+      }
+
+      /* Top Information Section - Clean Design */
+      .top-info {
+        display: flex;
+        justify-content: space-between;
+        margin: 15px 0;
+        padding: 15px 20px;
+        border: 2px solid #0a2b20;
+        border-radius: 4px;
+      }
+
+      .info-column {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+
+      .info-column.left {
+        width: 48%;
+      }
+
+      .info-column.right {
+        width: 48%;
+      }
+
+      .info-row {
+        display: flex;
+        align-items: center;
+      }
+
+      .info-label {
+        font-weight: 700;
+        color: #1a4d3a;
+        font-size: 11px;
+        font-family: Arial, sans-serif;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        min-width: 140px;
+      }
+
+      .info-value {
+        font-weight: 600;
+        color: #333;
+        font-size: 12px;
+        font-family: Arial, sans-serif;
+      }
+
+      .section-title {
+        text-align: center;
+        font-size: 16px;
+        font-weight: 600;
+        margin: 15px 0 12px 0;
+        padding: 10px;
+        background: #1a4d3a;
+        color: white;
+        text-transform: uppercase;
+        letter-spacing: 3px;
+        font-family: "Georgia", serif;
+      }
+
+      .details-table {
+        width: 100%;
+        border-collapse: collapse;
+        margin: 10px 0;
+        font-family: Arial, sans-serif;
+        table-layout: fixed;
+      }
+
+      .details-table td {
+        border: 1px solid #0a2b20;
+        padding: 6px 8px;
+        font-size: 9px;
+        line-height: 1.15;
+        background: transparent;
+        overflow-wrap: anywhere;
+        word-break: break-word;
+      }
+
+      .details-table .label-cell {
+        font-weight: 700;
+        text-align: left;
+        width: 22%;
+        color: #1a4d3a;
+        vertical-align: middle;
+        text-transform: uppercase;
+        letter-spacing: 0.3px;
+        font-size: 8px;
+      }
+
+      .details-table .value-cell {
+        font-weight: 600;
+        text-align: center;
+        width: 28%;
+        color: #333;
+        font-size: 10px;
+        vertical-align: top;
+        overflow-wrap: anywhere;
+        word-break: break-word;
+      }
+
+      .hco-watermark {
+        position: absolute;
+        top: 45%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        font-size: 160px;
+        font-weight: bold;
+        color: rgba(26, 77, 58, 0.03);
+        letter-spacing: 15px;
+        pointer-events: none;
+        z-index: 0;
+        font-family: "Georgia", serif;
+      }
+
+      /* Footer Styles */
+      .footer-section {
+        flex: 0 0 auto;
+        padding-top: 15px;
+        border-top: 2px solid #1a4d3a;
+      }
+
+      .footer-meta-table {
+        width: 100%;
+        border-collapse: collapse;
+        margin: 8px 0 4px 0;
+        font-family: Arial, sans-serif;
+        font-size: 9px;
+        color: #555;
+        font-style: italic;
+        table-layout: fixed;
+      }
+
+      .footer-meta-table td {
+        padding: 0;
+        vertical-align: top;
+      }
+
+      .footer-meta-table .footer-cert {
+        width: 40%;
+        text-align: left;
+        overflow-wrap: anywhere;
+        word-break: break-word;
+      }
+
+      .footer-meta-table .footer-reg {
+        width: 20%;
+        text-align: center;
+        white-space: nowrap;
+      }
+
+      .footer-meta-table .footer-vat {
+        width: 20%;
+        text-align: center;
+        white-space: nowrap;
+      }
+
+      .footer-meta-table .footer-page {
+        width: 20%;
+        text-align: right;
+        white-space: nowrap;
+      }
+
+      .signature-table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-bottom: 12px;
+      }
+
+      .sig-cell-left,
+      .sig-cell-right {
+        width: 50%;
+        padding: 8px;
+        vertical-align: bottom;
+      }
+
+      .sig-cell-left {
+        text-align: left;
+      }
+
+      .sig-cell-right {
+        text-align: right;
+      }
+
+      .signature-block {
+        display: inline-block;
+        text-align: center;
+      }
+
+      .signature-img {
+        height: 55px;
+        width: auto;
+        display: block;
+        margin: 0 auto 5px auto;
+      }
+
+      .signature-name {
+        font-size: 12px;
+        font-weight: 700;
+        color: #1a4d3a;
+        font-family: Arial, sans-serif;
+      }
+
+      .signature-title {
+        font-size: 10px;
+        color: #555;
+        font-family: Arial, sans-serif;
+      }
+
+      .recognition-text {
+        font-size: 8px;
+        color: #444;
+        text-align: center;
+        margin-bottom: 6px;
+        font-family: Arial, sans-serif;
+        line-height: 1.4;
+      }
+
+      .company-details {
+        font-size: 9px;
+        color: #333;
+        text-align: center;
+        font-weight: 600;
+        font-family: Arial, sans-serif;
+      }
+
+      .contact-details {
+        font-size: 9px;
+        color: #333;
+        text-align: center;
+        font-family: Arial, sans-serif;
+      }
+
+      .website {
+        font-size: 11px;
+        color: #1a4d3a;
+        text-align: center;
+        font-weight: 700;
+        font-family: Arial, sans-serif;
+        margin-bottom: 8px;
+      }
+
+      .verification-section {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 20px;
+        margin-top: 10px;
+        padding-top: 10px;
+        border-top: 1px solid #ddd;
+      }
+
+      .qr-code {
+        width: 60px;
+        height: 60px;
+        flex-shrink: 0;
+      }
+
+      .verification-text {
+        font-size: 10px;
+        color: #444;
+        font-family: Arial, sans-serif;
+        line-height: 1.6;
+        text-align: left;
+      }
+
+      .verification-text a {
+        color: #1a4d3a;
+        text-decoration: none;
+        font-weight: 700;
+      }
+
+      @media print {
+        body {
+          background-color: white;
+          padding: 0;
+          margin: 0;
+        }
+
+        .certificate-container {
+          box-shadow: none;
+          margin: 0;
+          page-break-after: avoid;
+          page-break-inside: avoid;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="certificate-container">
+      <!-- Corner Decorations -->
+      <div class="corner-decoration top-left"></div>
+      <div class="corner-decoration top-right"></div>
+      <div class="corner-decoration bottom-left"></div>
+      <div class="corner-decoration bottom-right"></div>
+
+      <!-- Pattern Overlay -->
+      <div class="pattern-overlay"></div>
+
+      <!-- HCO Watermark -->
+      <div class="hco-watermark">HCO</div>
+
+      <div class="content-wrapper">
+        <!-- Main Content -->
+        <div class="main-content">
+          <!-- Header -->
+          <div class="header">
+            <div class="logo-container">
+              <img class="hco-logo" src="HCO-Logo.png" alt="HCO Logo" />
+            </div>
+            <div class="main-title">HALAL EXPORT CERTIFICATE</div>
+          </div>
+
+          <!-- Top Information Section -->
+          <div class="top-info">
+            <div class="info-column left">
+              <div class="info-row">
+                <span class="info-label">Country of Origin:</span>
+                <span class="info-value">{country_of_origin}</span>
+              </div>
+              <div class="info-row">
+                <span class="info-label">Exporter:</span>
+                <span class="info-value">{exporter_name}</span>
+              </div>
+              <div class="info-row">
+                <span class="info-label">Destination:</span>
+                <span class="info-value">{destination}</span>
+              </div>
+            </div>
+            <div class="info-column right">
+              <div class="info-row">
+                <span class="info-label">Certificate No:</span>
+                <span class="info-value">{certificate_no}</span>
+              </div>
+              <div class="info-row">
+                <span class="info-label">Standard:</span>
+                <span class="info-value">{standard}</span>
+              </div>
+              <div class="info-row">
+                <span class="info-label">Issue Date:</span>
+                <span class="info-value">{issue_date}</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Details of Consignment Section -->
+          <div class="section-title">Details of Consignment</div>
+
+          <!-- Details Table -->
+          <table class="details-table">
+            <tr>
+              <td class="label-cell">Certificate Issue Date</td>
+              <td class="value-cell">{certificate_issue_date}</td>
+              <td class="label-cell">Importer</td>
+              <td class="value-cell">{importer_name}</td>
+            </tr>
+            <tr>
+              <td class="label-cell">Date of Slaughter</td>
+              <td class="value-cell">{slaughter_date}</td>
+              <td class="label-cell">Abattoir Address</td>
+              <td class="value-cell">{abattoir_address}</td>
+            </tr>
+            <tr>
+              <td class="label-cell">Expiry Date</td>
+              <td class="value-cell">{expiry_date}</td>
+              <td class="label-cell">Number of Lamb Carcasses</td>
+              <td class="value-cell">{number_of_carcasses}</td>
+            </tr>
+            <tr>
+              <td class="label-cell">Gross Weight</td>
+              <td class="value-cell">{gross_weight}</td>
+              <td class="label-cell">Number of Boxes</td>
+              <td class="value-cell">{number_of_boxes}</td>
+            </tr>
+            <tr>
+              <td class="label-cell">Net Weight</td>
+              <td class="value-cell">{net_weight}</td>
+              <td class="label-cell">Batch Reference</td>
+              <td class="value-cell">{batch_reference}</td>
+            </tr>
+            <tr>
+              <td class="label-cell">Halal Certificate Number</td>
+              <td class="value-cell">{halal_cert_number}</td>
+              <td class="label-cell">Vet Certificate Number</td>
+              <td class="value-cell">{vet_cert_number}</td>
+            </tr>
+            <tr>
+              <td class="label-cell">Destination Port</td>
+              <td class="value-cell">{destination_port}</td>
+              <td class="label-cell">Loading Port</td>
+              <td class="value-cell">{loading_port}</td>
+            </tr>
+            <tr>
+              <td class="label-cell">Flight Number</td>
+              <td class="value-cell">{flight_number}</td>
+              <td class="label-cell">AWB Number</td>
+              <td class="value-cell">{awb_number}</td>
+            </tr>
+            <tr>
+              <td class="label-cell">Meat Type</td>
+              <td class="value-cell">{meat_type}</td>
+              <td class="label-cell">Condition of Meat</td>
+              <td class="value-cell">{meat_condition}</td>
+            </tr>
+            <tr>
+              <td class="label-cell">Halal Inspector / Auditor</td>
+              <td class="value-cell" colspan="3">{inspector_name}</td>
+            </tr>
+          </table>
+        </div>
+
+        <!-- Footer Section -->
+        <div class="footer-section">
+          <table class="signature-table">
+            <tr>
+              <td class="sig-cell-left" style="width: 33%;"></td>
+              <td
+                style="
+                  text-align: center;
+                  vertical-align: middle;
+                  width: 33%;
+                "
+              >
+                {export_logo_html}
+              </td>
+              <td class="sig-cell-right" style="width: 33%;">
+                {signature_block_html}
+              </td>
+            </tr>
+          </table>
+
+          <div class="recognition-text">
+            HCO is recognised by GSO & SMIIC (GAC), SFDA, SASO, MOIAT, MOPH
+            (Qatar), MUIS(Singapore), CICOT (Thailand), IMANOR (Morocco) & has
+            other collaborations globally.
+          </div>
+          <div class="company-details">
+            Halal Certification Organisation Limited, 34 Mornington Road,
+            Birmingham, West Midlands, B66 2JE
+          </div>
+          <div class="contact-details">
+            T: +44 (0)333 5770902 E: info@hcoltd.co.uk
+          </div>
+          <div class="website">www.hcoltd.co.uk</div>
+          <table class="footer-meta-table">
+            <tr>
+              <td class="footer-cert">{cert_num_footer}</td>
+              <td class="footer-reg">Reg No. 10321924</td>
+              <td class="footer-vat">VAT No. 273 575 085</td>
+              <td class="footer-page">Page {page_number} of {total_pages}</td>
+            </tr>
+          </table>
+          <div class="verification-section">
+            <img class="qr-code" src="qr.png" alt="QR Code" />
+            <div class="verification-text">
+              To verify this certificate, please scan the QR code<br />
+              or visit
+              <a href="https://www.hcoltd.co.uk/certificatevalidation"
+                >www.hcoltd.co.uk/certificatevalidation</a
+              >
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>

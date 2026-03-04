@@ -1,0 +1,9 @@
+{
+  "rewrites": [
+    {
+      "source": "/api/(.*)",
+      "destination": "https://hco.sandbox-london-b.fetch-ai.com/$1"
+    }
+  ]
+}
+

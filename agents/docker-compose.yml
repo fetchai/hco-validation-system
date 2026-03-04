@@ -1,0 +1,16 @@
+services:
+  hco-agent:
+    build: .
+    container_name: hco-agent-v3
+    ports:
+      - "8096:8096"
+    volumes:
+      # Persist generated files on host so you can see PDFs without entering the container
+      - ./generated_certificates:/app/generated_certificates
+    # Use a single source of truth: ./hco-agent/.env (do not commit it).
+    # Note: Compose can still read a project ".env" for interpolation, but we avoid ${VAR} usage here.
+    env_file:
+      - .env
+    environment:
+      PYTHONUNBUFFERED: "1"
+    restart: unless-stopped
