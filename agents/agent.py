@@ -2,6 +2,9 @@ import os
 import base64
 import time
 import csv
+import logging
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from uuid import uuid4
 from typing import Any, Dict, List, Optional
@@ -9,7 +12,6 @@ from io import BytesIO
 from uagents import Agent, Context, Protocol, Model
 from uagents_core.storage import ExternalStorage
 from pydantic import Field
-# Import chat protocol components
 from uagents_core.contrib.protocols.chat import (
     chat_protocol_spec,
     ChatMessage,
@@ -21,17 +23,65 @@ from uagents_core.contrib.protocols.chat import (
 )
 
 from image_analysis import get_image_analysis, extract_certificate_data, validate_certificate_in_sheets
-# from certificate_generator import generate_certificate
 from html_certificate_generator import generate_certificate_with_html_templates, generate_export_certificate, generate_slaughterhouse_certificate
 from database import init_database, save_certificate_to_db, get_certificate_from_db, get_certificate_file_from_db
 from openai import OpenAI
 import re
 import requests
 from bs4 import BeautifulSoup
-import time
 import pandas as pd
 from io import StringIO
 import json
+
+import hco_logger as hlog
+
+hlog.configure()
+perf_logger = logging.getLogger("hco.perf")
+perf_logger.setLevel(logging.INFO)
+
+
+@contextmanager
+def step_timer(step_name: str, timings: Dict[str, float]):
+    """Record wall-time of a code block into *timings[step_name]* (seconds)."""
+    t0 = time.monotonic()
+    try:
+        yield
+    finally:
+        elapsed = time.monotonic() - t0
+        timings[step_name] = elapsed
+        perf_logger.info("STEP_TIMER %s=%.2fs", step_name, elapsed)
+
+
+# ---------------------------------------------------------------------------
+# In-process async job store for long-running certificate generation
+# ---------------------------------------------------------------------------
+_generation_jobs: Dict[str, Dict[str, Any]] = {}
+_jobs_lock = threading.Lock()
+
+GENERATION_JOB_TTL_S = 3600  # keep completed jobs for 1 hour
+
+
+def _set_job(job_id: str, data: Dict[str, Any]) -> None:
+    with _jobs_lock:
+        _generation_jobs[job_id] = data
+
+
+def _get_job(job_id: str) -> Optional[Dict[str, Any]]:
+    with _jobs_lock:
+        return _generation_jobs.get(job_id)
+
+
+def _gc_jobs() -> None:
+    """Remove completed/failed jobs older than TTL."""
+    now = time.time()
+    with _jobs_lock:
+        expired = [
+            jid for jid, jdata in _generation_jobs.items()
+            if jdata.get("status") in ("done", "failed")
+            and now - jdata.get("updated_at", 0) > GENERATION_JOB_TTL_S
+        ]
+        for jid in expired:
+            del _generation_jobs[jid]
 
 
 def _openai_chat_completion_with_retry(
@@ -161,6 +211,23 @@ class CertificateResponse(Model):
     download_url: str = ""
     csv_logged: bool
     processed: bool
+    job_id: str = ""
+    async_mode: bool = False
+
+
+class GenerationStatusRequest(Model):
+    job_id: str
+
+
+class GenerationStatusResponse(Model):
+    timestamp: int
+    job_id: str
+    status: str  # queued | running | done | failed
+    message: str = ""
+    certificate_id: str = ""
+    download_url: str = ""
+    timings: Dict[str, float] = Field(default_factory=dict)
+
 
 class ProductVerifyRequest(Model):
     certificate_no: str
@@ -732,7 +799,7 @@ If you absolutely cannot find anything that could be a certificate number, retur
         return result
         
     except Exception as e:
-        print(f"Error using OpenAI for certificate extraction: {e}")
+        hlog.warn("VERIFY", "openai cert extraction failed", reason=str(e))
         # Fallback to regex patterns
         return extract_certificate_number_regex_fallback(text)
 
@@ -772,7 +839,7 @@ def _llm_match_products(user_items: List[str], excel_items: List[str], item_type
             unresolved.append(item)
 
     if not unresolved:
-        print(f"[ProductVerify] Quick match resolved {len(results)}/{len(user_items)}, sending {len(unresolved)} to LLM")
+        hlog.info("VERIFY", "products quick match", resolved=len(results), total=len(user_items))
         return results
 
     # LLM fuzzy match for remaining items
@@ -787,7 +854,7 @@ def _llm_match_products(user_items: List[str], excel_items: List[str], item_type
             f"Example: {{\"Beef-XP 1.8kg\": true, \"Unknown Product\": false}}"
         )
 
-        print(f"[ProductVerify] Calling LLM for {len(unresolved)} {item_type}...")
+        hlog.info("VERIFY", "products llm match", unresolved=len(unresolved), item_type=item_type)
         resp = _openai_chat_completion_with_retry(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
@@ -795,7 +862,6 @@ def _llm_match_products(user_items: List[str], excel_items: List[str], item_type
             max_tokens=512,
         )
         raw = (resp.choices[0].message.content or "").strip()
-        print(f"[ProductVerify] LLM raw response: {raw[:500]}")
         if raw.startswith("```"):
             raw = re.sub(r"^```(?:json)?\s*", "", raw)
             raw = re.sub(r"\s*```$", "", raw)
@@ -803,13 +869,12 @@ def _llm_match_products(user_items: List[str], excel_items: List[str], item_type
         if isinstance(llm_result, dict):
             for item in unresolved:
                 results[item] = bool(llm_result.get(item, False))
-            print(f"[ProductVerify] LLM results: {llm_result}")
         else:
-            print(f"[ProductVerify] LLM returned non-dict: {type(llm_result)}")
+            hlog.warn("VERIFY", "products llm returned non-dict", got=str(type(llm_result)))
             for item in unresolved:
                 results[item] = False
     except Exception as e:
-        print(f"[ProductVerify] LLM error: {e}")
+        hlog.warn("VERIFY", "products llm error", reason=str(e))
         for item in unresolved:
             results[item] = False
 
@@ -1029,7 +1094,6 @@ def _extract_products_from_text(text: str) -> tuple:
                 "If no products found, return: {\"names\": [], \"codes\": []}"
             )
 
-            print(f"[ProductExtract] Regex found nothing, using LLM to extract from: {clean_text[:200]}")
             resp = _openai_chat_completion_with_retry(
                 model="gpt-4o-mini",
                 messages=[{"role": "user", "content": prompt}],
@@ -1047,9 +1111,8 @@ def _extract_products_from_text(text: str) -> tuple:
                 if llm_names or llm_codes:
                     names = llm_names
                     codes = llm_codes
-                    print(f"[ProductExtract] LLM extracted names={names}, codes={codes}")
         except Exception as e:
-            print(f"[ProductExtract] LLM extraction failed: {e}")
+            hlog.warn("VERIFY", "product extract llm failed", reason=str(e))
 
     return names, codes
 
@@ -1118,7 +1181,7 @@ def _process_text_query(query: str) -> dict:
                 result["missing_product_codes"] = list(payload.get("missing_product_codes") or [])
                 return result
             except Exception as e:
-                print(f"[ProductVerify] Error in _process_text_query: {e}")
+                hlog.warn("VERIFY", "product verify text query failed", reason=str(e))
                 result["message"] = (
                     f"Error verifying products for certificate {certificate_no}. "
                     "Please try again or use the Product Verification form for more reliable results."
@@ -1401,8 +1464,8 @@ Respond with only one word: "inquiry", "verification", "product_verification", "
             return "inquiry"  # Default to inquiry if unclear
             
     except Exception as e:
-        print(f"Error classifying query with OpenAI: {e}")
-        return "inquiry"  # Default to inquiry on error
+        hlog.warn("APP", "query classify failed", reason=str(e))
+        return "inquiry"
 
 def get_relevant_urls(query):
     """Determine which HCO website URLs are relevant to the user's query"""
@@ -1471,51 +1534,44 @@ def scrape_website_content(url):
         return text
         
     except Exception as e:
-        print(f"Error scraping {url}: {e}")
+        hlog.warn("APP", "scrape failed", url=url, reason=str(e))
         return ""
 
 def search_hco_website(query):
     """Extract content from relevant HCO website pages using web scraping for inquiry-related questions"""
-    # Get only relevant URLs based on the query
     relevant_urls = get_relevant_urls(query)
-    print(f"Selected relevant URLs for query '{query}': {relevant_urls}")
-    
+    hlog.info("APP", "scrape start", query=query, urls=len(relevant_urls))
+
     all_content = []
-    
+
     try:
         for url in relevant_urls:
             try:
-                print(f"Scraping content from: {url}")
                 content = scrape_website_content(url)
-                
+
                 if content and content.strip():
-                    # Limit individual page content to avoid too much data
                     if len(content) > 2000:
                         content = content[:2000] + "...(content truncated)"
-                    
+
                     all_content.append(f"=== Content from {url} ===\n{content}\n")
-                    
-                # Small delay between requests to be respectful
+
                 time.sleep(1)
-                        
+
             except Exception as url_error:
-                print(f"Error scraping {url}: {url_error}")
+                hlog.warn("APP", "scrape failed", url=url, reason=str(url_error))
                 continue
-        
+
         if not all_content:
             return "No content could be extracted from any relevant HCO website pages."
-        
-        # Combine all extracted content
+
         combined_content = "\n".join(all_content)
-        
-        # Limit total content length to avoid token limits
         if len(combined_content) > 8000:
             combined_content = combined_content[:8000] + "\n...(content truncated)"
-        
+
         return combined_content
-        
+
     except Exception as e:
-        print(f"Error scraping HCO website: {e}")
+        hlog.warn("APP", "scrape pipeline failed", reason=str(e))
         return f"Error occurred while scraping the HCO website: {str(e)}"
 
 def get_relevant_links(query):
@@ -1635,7 +1691,7 @@ Generate a natural, helpful response as if you're a knowledgeable HCO representa
         return answer
         
     except Exception as e:
-        print(f"Error generating final answer with OpenAI: {e}")
+        hlog.warn("APP", "final answer llm failed", reason=str(e))
         return "I'm having trouble accessing that information right now. Please contact HCO directly at info@hcoltd.co.uk or +44 (0) 333 577 0902 for assistance!"
 
 def generate_marketing_content(query):
@@ -1701,7 +1757,7 @@ Keep the content concise but impactful (150-300 words).
         return final_content
         
     except Exception as e:
-        print(f"Error generating marketing content with OpenAI: {e}")
+        hlog.warn("APP", "marketing content llm failed", reason=str(e))
         return "I'm having trouble generating marketing content right now. For marketing materials and promotional content, please contact HCO directly at info@hcoltd.co.uk or +44 (0) 333 577 0902. They'll be happy to provide you with professional marketing materials!"
 
 def process_files_with_openai(files_data: List[Dict]) -> List[Dict]:
@@ -1716,122 +1772,91 @@ def process_files_with_openai(files_data: List[Dict]) -> List[Dict]:
             filename = file_data.get('filename', 'unknown')
             file_content = file_data.get('content', '')
             
-            print(f"Processing file: {filename}")
-            
-            # Determine file type and read accordingly
+            hlog.info("GENERATE", "extract products start", file=filename)
+
             if filename.lower().endswith('.csv'):
-                # Read CSV content
                 df = pd.read_csv(StringIO(file_content))
             elif filename.lower().endswith(('.xlsx', '.xls')):
-                # Use multiple strategies to read Excel files, prioritizing OpenAI-based analysis
-                print(f"Processing Excel file: {filename}")
-                
-                # Strategy 1: Try multiple Excel reading libraries
                 df = None
                 excel_reading_success = False
-                
-                # Try openpyxl first (more robust for newer files)
+
                 if not excel_reading_success:
                     try:
                         import openpyxl
                         import io
                         excel_file = io.BytesIO(file_content)
-                        
-                        # Try to load with openpyxl (read-only mode)
                         wb = openpyxl.load_workbook(excel_file, read_only=True, data_only=True)
                         sheet_names = wb.sheetnames
-                        print(f"Openpyxl found sheets: {sheet_names}")
-                        
-                        # Look for "final product name" sheet (exact match first, then partial)
+
                         target_sheet_name = None
-                        print(f"🔍 Searching for 'final product name' sheet in: {sheet_names}")
-                        
-                        # First, try exact match variations
                         for sheet_name in sheet_names:
                             sheet_lower = sheet_name.lower().strip()
                             if sheet_lower == "final product name" or sheet_lower == "final product names":
                                 target_sheet_name = sheet_name
-                                print(f"✅ Found exact match sheet: '{sheet_name}'")
                                 break
-                        
-                        # If no exact match, try partial matches
+
                         if not target_sheet_name:
                             for sheet_name in sheet_names:
                                 sheet_lower = sheet_name.lower()
-                                if ("final" in sheet_lower and "product" in sheet_lower and "name" in sheet_lower):
+                                if "final" in sheet_lower and "product" in sheet_lower and "name" in sheet_lower:
                                     target_sheet_name = sheet_name
-                                    print(f"✅ Found partial match sheet: '{sheet_name}'")
                                     break
-                        
-                        # If still no match, try any sheet with "product" or "final"
+
                         if not target_sheet_name:
                             for sheet_name in sheet_names:
                                 sheet_lower = sheet_name.lower()
                                 if "product" in sheet_lower or "final" in sheet_lower:
                                     target_sheet_name = sheet_name
-                                    print(f"⚠️  Using fallback sheet: '{sheet_name}'")
                                     break
-                        
-                        # Last resort: use first sheet
+
                         if not target_sheet_name:
                             target_sheet_name = sheet_names[0]
-                            print(f"⚠️  Using first sheet as fallback: '{target_sheet_name}'")
-                        
+
                         ws = wb[target_sheet_name]
-                        
-                        # Convert to list of lists for processing
                         data_rows = []
                         headers = []
-                        
                         for row_idx, row in enumerate(ws.iter_rows(values_only=True)):
                             if row_idx == 0:
                                 headers = [str(cell) if cell is not None else f"Column_{i}" for i, cell in enumerate(row)]
                             data_rows.append([str(cell) if cell is not None else "" for cell in row])
-                        
-                        # Create DataFrame
+
                         if data_rows:
                             df = pd.DataFrame(data_rows[1:], columns=headers) if len(data_rows) > 1 else pd.DataFrame(columns=headers)
                             excel_reading_success = True
-                            print(f"Successfully read Excel file with openpyxl: {df.shape}")
-                            
+                            hlog.info("GENERATE", "excel read", engine="openpyxl", sheet=target_sheet_name, rows=df.shape[0], cols=df.shape[1])
+
                     except Exception as openpyxl_error:
-                        print(f"Openpyxl failed: {openpyxl_error}")
-                
-                # Try xlrd for older Excel files (.xls)
+                        hlog.warn("GENERATE", "openpyxl failed", reason=str(openpyxl_error))
+
                 if not excel_reading_success and filename.lower().endswith('.xls'):
                     try:
                         import xlrd
-                        
                         workbook = xlrd.open_workbook(file_contents=file_content)
                         sheet_names = workbook.sheet_names()
-                        print(f"Xlrd found sheets: {sheet_names}")
-                        
-                        # Look for Final Product Names sheet
+
                         target_sheet = None
                         for sheet_name in sheet_names:
                             if "final" in sheet_name.lower() and "product" in sheet_name.lower():
                                 target_sheet = workbook.sheet_by_name(sheet_name)
                                 break
-                        
+
                         if not target_sheet:
                             target_sheet = workbook.sheet_by_index(0)
-                        
-                        # Convert to DataFrame
+
                         headers = [str(target_sheet.cell_value(0, col)) for col in range(target_sheet.ncols)]
                         data = []
                         for row in range(1, target_sheet.nrows):
                             data.append([str(target_sheet.cell_value(row, col)) for col in range(target_sheet.ncols)])
-                        
+
                         df = pd.DataFrame(data, columns=headers)
                         excel_reading_success = True
-                        print(f"Successfully read Excel file with xlrd: {df.shape}")
-                        
+                        hlog.info("GENERATE", "excel read", engine="xlrd", rows=df.shape[0], cols=df.shape[1])
+
                     except Exception as xlrd_error:
-                        print(f"Xlrd failed: {xlrd_error}")
-                
-                # Strategy 2: If traditional methods fail, use OpenAI to analyze the file
+                        hlog.warn("GENERATE", "xlrd failed", reason=str(xlrd_error))
+
                 if not excel_reading_success:
-                    print(f"Traditional Excel reading failed for {filename}. Using OpenAI analysis...")
+                    hlog.warn("GENERATE", "excel unreadable, asking llm to synthesize sample products", file=filename)
                     
                     try:
                         # Create a mock analysis with OpenAI based on filename and common patterns
@@ -1882,7 +1907,7 @@ Return only valid JSON, no explanations.
                             result_json = json.loads(cleaned_text)
                             
                             if 'products' in result_json and isinstance(result_json['products'], list):
-                                print(f"OpenAI generated {len(result_json['products'])} sample products for {filename}")
+                                synth_count = 0
                                 for product in result_json['products']:
                                     if 'product_code' in product and 'product_name' in product:
                                         extracted_products.append({
@@ -1890,56 +1915,35 @@ Return only valid JSON, no explanations.
                                             'product_name': product['product_name'],
                                             'source_file': filename + " (OpenAI generated)"
                                         })
-                                        print(f"Generated: {product['product_code']} - {product['product_name']}")
-                                        
-                                # Continue to next file since OpenAI extraction succeeded
+                                        synth_count += 1
+                                hlog.warn("GENERATE", "synthesized products via llm", file=filename, count=synth_count)
                                 continue
-                            else:
-                                print(f"No products found in OpenAI response for {filename}")
-                                
+                            hlog.warn("GENERATE", "llm response had no products", file=filename)
+
                         except json.JSONDecodeError as json_error:
-                            print(f"Error parsing OpenAI JSON response for {filename}: {json_error}")
-                            print(f"Raw response: {result_text[:200]}...")
-                            # Try manual fallback extraction
-                            print(f"Attempting manual extraction fallback for {filename}")
+                            hlog.warn("GENERATE", "llm response not parseable, trying manual extract", file=filename, reason=str(json_error))
                             fallback_products = manual_extract_products(df, filename)
                             if fallback_products:
                                 extracted_products.extend(fallback_products)
-                                print(f"Manual extraction found {len(fallback_products)} products")
-                            else:
-                                print(f"Manual extraction failed, file will be skipped")
-                            
+                                hlog.info("GENERATE", "manual extract", file=filename, count=len(fallback_products))
+
                     except Exception as openai_error:
-                        print(f"OpenAI analysis failed for {filename}: {openai_error}")
-                        
-                        # Try manual fallback extraction
-                        print(f"Attempting manual extraction fallback for {filename}")
+                        hlog.warn("GENERATE", "llm analysis failed, trying manual extract", file=filename, reason=str(openai_error))
                         fallback_products = manual_extract_products(df, filename)
                         if fallback_products:
                             extracted_products.extend(fallback_products)
-                            print(f"Manual extraction found {len(fallback_products)} products")
+                            hlog.info("GENERATE", "manual extract", file=filename, count=len(fallback_products))
                         else:
-                            # Create informative error entry
                             extracted_products.append({
                                 'product_code': 'PROCESSING_ERROR',
                                 'product_name': f'Unable to extract products from {filename} - file format may not be supported',
                                 'source_file': filename
                             })
-                            print(f"Created error entry for {filename}")
                         continue
-                
-                # If we successfully read the Excel file, continue with normal processing
+
             else:
-                print(f"Unsupported file type: {filename}")
+                hlog.warn("GENERATE", "unsupported file type", file=filename)
                 continue
-            
-            # First, analyze the columns to understand the structure
-            print(f"Columns found: {list(df.columns)}")
-            print(f"DataFrame shape: {df.shape}")
-            
-            # Show first few rows for debugging
-            print("First 3 rows:")
-            print(df.head(3).to_string())
             
             # Focus specifically on the "Final Product Names" sheet since every file has this
             final_product_data = None
@@ -1963,43 +1967,31 @@ Return only valid JSON, no explanations.
                     sheet_names = wb.sheetnames
                     wb.close()
                     
-                    print(f"Found {len(sheet_names)} sheets: {sheet_names}")
-                    
-                    # Look specifically for "Final Product Names" sheet
                     target_sheet = None
                     for sheet_name in sheet_names:
                         if "final" in sheet_name.lower() and "product" in sheet_name.lower():
                             target_sheet = sheet_name
                             break
-                    
+
                     if target_sheet:
-                        print(f"Found target sheet: '{target_sheet}'")
                         try:
-                            # Read the Final Product Names sheet
                             final_df = pd.read_excel(temp_path, sheet_name=target_sheet)
                             final_product_data = final_df.to_string(index=False)
-                            print(f"Collected Final Product Names data (shape: {final_df.shape})")
                         except Exception as sheet_error:
-                            print(f"Error reading Final Product Names sheet: {sheet_error}")
+                            hlog.warn("GENERATE", "sheet read failed", sheet=target_sheet, reason=str(sheet_error))
                             final_product_data = None
                     else:
-                        print(f"No 'Final Product Names' sheet found in {filename}")
-                        # Fallback to first sheet
                         if sheet_names:
                             target_sheet = sheet_names[0]
                             final_df = pd.read_excel(temp_path, sheet_name=target_sheet)
                             final_product_data = final_df.to_string(index=False)
-                            print(f"Using fallback sheet: '{target_sheet}'")
-                    
-                    # Clean up temp file
+
                     import os
                     os.unlink(temp_path)
-                    
+
                 except Exception as sheet_error:
-                    print(f"Sheet analysis failed: {sheet_error}")
-                    # Fallback to current dataframe
+                    hlog.warn("GENERATE", "sheet analysis failed", file=filename, reason=str(sheet_error))
                     final_product_data = df.head(20).to_string(index=False)
-                    print(f"Falling back to default sheet analysis for {filename}")
             else:
                 # For non-Excel files, use the current dataframe
                 final_product_data = df.head(20).to_string(index=False)
@@ -2078,34 +2070,31 @@ Return only valid JSON. Extract ALL product codes and names from the Final Produ
                 result_json = json.loads(cleaned_text)
                 
                 if 'products' in result_json and isinstance(result_json['products'], list):
-                    print(f"OpenAI extracted {len(result_json['products'])} products from {filename}")
+                    valid_count = 0
                     for product in result_json['products']:
                         if 'product_code' in product and 'product_name' in product:
                             extracted_products.append({
                                 'product_code': product['product_code'],
                                 'product_name': product['product_name'],
-                                'source_file': filename
+                                'source_file': filename,
                             })
-                            print(f"Extracted: {product['product_code']} - {product['product_name']}")
-                    # Continue to next file since OpenAI extraction succeeded
+                            valid_count += 1
+                    hlog.info("GENERATE", "products extracted", source="llm", file=filename, count=valid_count)
                     continue
                 else:
-                    print(f"Invalid response structure from OpenAI for {filename}")
-                    # Fallback to manual extraction
+                    hlog.warn("GENERATE", "llm returned invalid structure, using manual extract", file=filename)
                     fallback_products = manual_extract_products(df, filename)
                     extracted_products.extend(fallback_products)
                     continue
-                    
+
             except json.JSONDecodeError as json_error:
-                print(f"Error parsing JSON response for {filename}: {json_error}")
-                print(f"Raw response: {result_text[:200]}...")
-                # Fallback to manual extraction
+                hlog.warn("GENERATE", "llm response not parseable, using manual extract", file=filename, reason=str(json_error))
                 fallback_products = manual_extract_products(df, filename)
                 extracted_products.extend(fallback_products)
                 continue
-                
+
         except Exception as e:
-            print(f"Error processing CSV file {filename}: {e}")
+            hlog.warn("GENERATE", "csv processing failed", file=filename, reason=str(e))
             continue
     
     return extracted_products
@@ -2119,30 +2108,21 @@ def manual_extract_products(df: pd.DataFrame, filename: str) -> List[Dict]:
         is_vitalife_format = any('Unnamed:' in str(col) for col in df.columns)
         
         if is_vitalife_format:
-            print(f"Detected VITALIFEHCO format for {filename}")
-            # Special handling for VITALIFEHCO format
+            hlog.info("GENERATE", "vitalife format detected", file=filename)
             for index, row in df.iterrows():
                 try:
-                    # Check columns for product data
                     col1_val = str(row.iloc[1]).strip() if len(row) > 1 and pd.notna(row.iloc[1]) else ""
                     col2_val = str(row.iloc[2]).strip() if len(row) > 2 and pd.notna(row.iloc[2]) else ""
-                    
-                    # Look for product codes in column 1 (like BMS7573)
-                    # and product names in column 2 (like "Vitalife Blueberry & Kiwi")
-                    if (col1_val and col1_val not in ['nan', 'Product Code'] and 
+
+                    if (col1_val and col1_val not in ['nan', 'Product Code'] and
                         col2_val and 'vitalife' in col2_val.lower()):
-                        
-                        product_code = col1_val
-                        product_name = col2_val
-                        
+
                         products.append({
-                            'product_code': product_code,
-                            'product_name': product_name,
+                            'product_code': col1_val,
+                            'product_name': col2_val,
                             'source_file': filename
                         })
-                        print(f"VITALIFE extraction: {product_code} - {product_name}")
-                        
-                except Exception as row_error:
+                except Exception:
                     continue
         else:
             # Standard extraction logic for regular Excel/CSV files
@@ -2190,9 +2170,6 @@ def manual_extract_products(df: pd.DataFrame, filename: str) -> List[Dict]:
             if packaging_columns:
                 packaging_col = packaging_columns[0]
             
-            print(f"Manual extraction using - Code column: {code_col}, Name column: {name_col}, Packaging column: {packaging_col}")
-            
-            # Extract products
             for index, row in df.iterrows():
                 try:
                     # Get product code
@@ -2231,15 +2208,15 @@ def manual_extract_products(df: pd.DataFrame, filename: str) -> List[Dict]:
                         if packaging_col and pd.notna(row.get(packaging_col)):
                             entry['packaging_details'] = str(row[packaging_col]).strip()
                         products.append(entry)
-                        print(f"Manual extraction: {product_code} - {product_name}")
-                        
-                except Exception as row_error:
-                    print(f"Error processing row {index}: {row_error}")
+
+                except Exception:
                     continue
-                
+
     except Exception as e:
-        print(f"Error in manual extraction for {filename}: {e}")
-    
+        hlog.warn("GENERATE", "manual extract failed", file=filename, reason=str(e))
+
+    if products:
+        hlog.info("GENERATE", "manual extract complete", file=filename, count=len(products))
     return products
 
 def generate_certificate_with_products(
@@ -2267,18 +2244,13 @@ def generate_certificate_with_products(
             standards=standards
         )
         
-        # Log the extracted products for reference
         if products:
-            print(f"Certificate {certificate_no} includes {len(products)} products:")
-            for product in products[:5]:  # Show first 5 products
-                print(f"  - {product.get('product_code', 'N/A')}: {product.get('product_name', 'N/A')}")
-            if len(products) > 5:
-                print(f"  ... and {len(products) - 5} more products")
-        
+            hlog.info("GENERATE", "certificate products bound", cert_no=certificate_no, count=len(products))
+
         return success
-        
+
     except Exception as e:
-        print(f"Error generating certificate with products: {e}")
+        hlog.error("GENERATE", "certificate with products failed", reason=str(e))
         return False
 
 def extract_certificate_number_regex_fallback(text):
@@ -2355,7 +2327,7 @@ def upload_certificate_to_supabase(certificate_no, file_data, file_type):
         supabase_key = os.getenv("SUPABASE_ANON_KEY")
         
         if not supabase_url or not supabase_key:
-            print("Supabase credentials not configured")
+            hlog.warn("APP", "supabase not configured")
             return None
         
         import requests
@@ -2378,11 +2350,11 @@ def upload_certificate_to_supabase(certificate_no, file_data, file_type):
             public_url = f"{supabase_url}/storage/v1/object/public/{bucket_name}/{file_path}"
             return public_url
         else:
-            print(f"Failed to upload to Supabase: {response.status_code} - {response.text}")
+            hlog.warn("APP", "supabase upload failed", status=response.status_code)
             return None
-            
+
     except Exception as e:
-        print(f"Error uploading to Supabase: {e}")
+        hlog.warn("APP", "supabase upload error", reason=str(e))
         return None
 
 def generate_supabase_download_url(certificate_no, file_type):
@@ -2408,8 +2380,7 @@ def generate_supabase_download_url(certificate_no, file_type):
         return f"{fallback_url}?certificate_no={certificate_no}&file_type={file_type}"
         
     except Exception as e:
-        print(f"Error generating download URL: {e}")
-        # Return fallback URL
+        hlog.warn("APP", "download url generation failed", cert_no=certificate_no, reason=str(e))
         agent_url = os.getenv("AGENT_URL", "http://localhost:8025")
         return f"{agent_url}/certificate/download?certificate_no={certificate_no}&file_type={file_type}"
 
@@ -2425,15 +2396,17 @@ def verify_certificate(certificate_no):
     Override for testing:
       - Set HCO_VERIFY_EXCEL_FIRST=true to check Excel before local DB/fallback.
     """
+    started_at = time.monotonic()
     try:
         excel_first = (os.getenv("HCO_VERIFY_EXCEL_FIRST") or "").strip().lower() in ("1", "true", "yes")
+        hlog.verify_start(certificate_no, excel_first=excel_first)
 
         def _try_db() -> tuple[bool, dict]:
-            # Database / fallback file lookup (works even when cloud sources aren't configured)
             try:
                 from database import get_certificate_from_db
                 db_cert = get_certificate_from_db(certificate_no)
                 if db_cert:
+                    hlog.verify_source(certificate_no, source="database", status="found")
                     return True, {
                         'certificate_no': db_cert.get('certificate_no', certificate_no),
                         'issue_date': db_cert.get('issue_date', ''),
@@ -2441,13 +2414,13 @@ def verify_certificate(certificate_no):
                         'company_name': db_cert.get('company_name', ''),
                         'source': 'local_db_or_files',
                     }
+                hlog.verify_source(certificate_no, source="database", status="not_found")
             except Exception as db_err:
-                # Don't fail validation entirely if DB isn't configured
-                print(f"Database lookup skipped/failed: {db_err}")
+                hlog.verify_source(certificate_no, source="database", status="error")
+                hlog.warn("VERIFY", "database lookup failed", cert_no=certificate_no, reason=str(db_err))
             return False, {}
 
         def _try_excel() -> tuple[bool, dict]:
-            # Excel lookup via Microsoft Graph (optional)
             try:
                 ms_excel_share_url = os.getenv("HCO_EXCEL_SHARE_URL") or os.getenv("EXCEL_SHARE_URL")
                 ms_table_name = (
@@ -2456,6 +2429,7 @@ def verify_certificate(certificate_no):
                     or "Certificates"
                 )
                 if not ms_excel_share_url:
+                    hlog.verify_source(certificate_no, source="excel_graph", status="skipped")
                     return False, {}
 
                 from microsoft_graph import get_access_token, find_row_in_excel_table_by_column_value
@@ -2469,6 +2443,7 @@ def verify_certificate(certificate_no):
                     token=token,
                 )
                 if row:
+                    hlog.verify_source(certificate_no, source="excel_graph", status="found")
                     return True, {
                         'certificate_no': row.get('certificate_no', certificate_no),
                         'issue_date': row.get('issue_date', ''),
@@ -2477,20 +2452,29 @@ def verify_certificate(certificate_no):
                         'certificate_url': row.get('certificate_url', ''),
                         'source': 'excel_graph',
                     }
+                hlog.verify_source(certificate_no, source="excel_graph", status="not_found")
             except Exception as excel_err:
-                print(f"Excel lookup skipped/failed: {excel_err}")
+                hlog.verify_source(certificate_no, source="excel_graph", status="error")
+                hlog.warn("VERIFY", "excel lookup failed", cert_no=certificate_no, reason=str(excel_err))
             return False, {}
 
-        # Execute in requested priority order
         attempts = (_try_excel, _try_db) if excel_first else (_try_db, _try_excel)
         for fn in attempts:
             ok, payload = fn()
             if ok:
+                hlog.verify_done(
+                    certificate_no,
+                    verified=True,
+                    duration_s=time.monotonic() - started_at,
+                    source=payload.get("source", ""),
+                    company=payload.get("company_name", ""),
+                )
                 return True, payload
 
+        hlog.verify_done(certificate_no, verified=False, duration_s=time.monotonic() - started_at)
         return False, {}
     except Exception as e:
-        print(f"Error verifying certificate: {e}")
+        hlog.error("VERIFY", "fatal", cert_no=certificate_no, reason=str(e))
         return False, {}
 
 # Chat protocol message handler
@@ -2895,9 +2879,146 @@ async def handle_image_upload(ctx: Context, req: ImageRequest) -> ImageResponse:
             processed=False,
         )
 
-# Flask app removed - using only uAgent REST endpoints
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
 
-# Removed Flask functionality - using only uAgent REST endpoints
+# Aliases used to extract product code/name from heterogeneous product dicts
+# (frontend payloads, docx parser output, sample data, etc.).
+_PRODUCT_CODE_KEYS: tuple[str, ...] = (
+    "product_code",
+    "productcode",
+    "code",
+    "Product Code",
+    "ProductCode",
+    "sku",
+    "item_code",
+    "itemcode",
+)
+_PRODUCT_NAME_KEYS: tuple[str, ...] = (
+    "description",
+    "product_name",
+    "productname",
+    "Product Name",
+    "ProductName",
+    "Description",
+    "product_description",
+    "name",
+)
+
+
+def _pick_first_str(item: Dict[str, Any], keys: tuple[str, ...]) -> str:
+    """Return the first non-empty stringified value found under *keys* (case-insensitive)."""
+    if not isinstance(item, dict):
+        return ""
+    lower_map = {str(k).strip().lower(): v for k, v in item.items()}
+    for key in keys:
+        for candidate in (key, key.lower(), key.replace(" ", "_").lower()):
+            val = lower_map.get(candidate)
+            if val is None:
+                continue
+            text = str(val).strip()
+            if text:
+                return text
+    return ""
+
+
+def _build_products_csv_pair(products: Any) -> tuple[str, str]:
+    """
+    Build comma-separated `products_code` / `products_name` strings from a list of
+    product dicts. Mirrors the aggregation done by the domestic generator so that
+    the shared Excel/verification surface stays consistent.
+
+    Edge cases:
+    - Items missing one side (code or name) are still emitted on the side that is
+      present; the other side is left blank for that index.
+    - Duplicate values are deduplicated while preserving first-seen order.
+    - Non-dict items are ignored.
+    """
+    if not isinstance(products, list):
+        return "", ""
+
+    codes: List[str] = []
+    names: List[str] = []
+    seen_codes: set[str] = set()
+    seen_names: set[str] = set()
+
+    for item in products:
+        code = _pick_first_str(item, _PRODUCT_CODE_KEYS)
+        name = _pick_first_str(item, _PRODUCT_NAME_KEYS)
+        if not code and not name:
+            continue
+        if code and code not in seen_codes:
+            codes.append(code)
+            seen_codes.add(code)
+        if name and name not in seen_names:
+            names.append(name)
+            seen_names.add(name)
+
+    return ",".join(codes), ",".join(names)
+
+
+def _excel_log_export(result: Dict[str, Any], req: "CertificateRequest", cert_type: str) -> None:
+    """Best-effort append of export certificate metadata to the shared Excel table."""
+    ms_excel_share_url = os.getenv("HCO_EXCEL_SHARE_URL") or os.getenv("EXCEL_SHARE_URL")
+    ms_table_name = os.getenv("HCO_EXCEL_TABLE_NAME") or os.getenv("EXCEL_TABLE_NAME") or "Certificates"
+    if not ms_excel_share_url:
+        hlog.excel_skipped("HCO_EXCEL_SHARE_URL not configured")
+        return
+    try:
+        from microsoft_graph import (
+            get_access_token,
+            get_excel_table_column_names,
+            append_row_to_shared_excel_table,
+        )
+        token = get_access_token()
+        uploaded_web_url = result.get("onedrive_web_url")
+        row_data: Dict[str, Any] = {
+            "certificate_id": result.get("certificate_id", ""),
+            "certificate_no": req.certificate_no,
+            "category": cert_type,
+            "issue_date": req.issue_date,
+            "company_reg_no": req.company_reg_no,
+            "company_name": req.company_name,
+            "certificate_url": uploaded_web_url,
+            "created_at": datetime.now().isoformat(),
+        }
+
+        # Parity with domestic flow: populate product code/name aggregates so
+        # downstream product verification (which reads from the Excel row) works
+        # identically for export_non_meat. Generator result is preferred when
+        # present so this also benefits export_meat if it ever returns products.
+        products_code = str(result.get("products_code") or "").strip()
+        products_name = str(result.get("products_name") or "").strip()
+        if (not products_code and not products_name) and cert_type == "export_non_meat":
+            products_code, products_name = _build_products_csv_pair(getattr(req, "products", None))
+
+        if products_code or products_name:
+            row_data["products_code"] = products_code
+            row_data["products_name"] = products_name
+            # Header alias support: some Excel tables use display-style headers.
+            # Populating both alias keys keeps the schema unchanged while matching
+            # whichever header style the workbook uses.
+            row_data["Product Code"] = products_code
+            row_data["Product Name"] = products_name
+
+        col_names = get_excel_table_column_names(ms_excel_share_url, ms_table_name, token)
+        if col_names:
+            values = [row_data.get(name) for name in col_names]
+        else:
+            values = [
+                row_data["certificate_id"],
+                row_data["certificate_no"],
+                row_data["issue_date"],
+                row_data["company_reg_no"],
+                row_data["company_name"],
+                row_data.get("certificate_url") or row_data.get("created_at"),
+            ]
+        append_row_to_shared_excel_table(ms_excel_share_url, ms_table_name, values, token)
+        hlog.excel_append(table=ms_table_name, cert_no=req.certificate_no, category=cert_type)
+    except Exception as ms_err:
+        hlog.warn("EXCEL", "append failed", table=ms_table_name, cert_no=req.certificate_no, reason=str(ms_err))
+
 
 @agent.on_rest_post("/generate-certificate", CertificateRequest, CertificateResponse)
 async def generate_certificate_endpoint(ctx: Context, req: CertificateRequest) -> CertificateResponse:
@@ -2987,8 +3108,9 @@ async def generate_certificate_endpoint(ctx: Context, req: CertificateRequest) -
         # Handle Export Certificates (Meat and Non-Meat)
         if cert_type in ("export_meat", "export_non_meat"):
             ctx.logger.info(f"Generating export certificate: {cert_type}")
+            timings: Dict[str, float] = {}
+            req_start = time.monotonic()
 
-            # Build data dict for export certificate
             export_data = {
                 "certificate_no": req.certificate_no,
                 "issue_date": req.issue_date,
@@ -3034,84 +3156,97 @@ async def generate_certificate_endpoint(ctx: Context, req: CertificateRequest) -
                     "export_products_per_page": req.export_products_per_page,
                 })
 
-            result = generate_export_certificate(cert_type, export_data)
+            # --- All export types (meat + non-meat): offload to background thread ---
+            job_id = str(uuid4())
+            _set_job(job_id, {
+                "status": "queued",
+                "message": "Certificate generation queued",
+                "updated_at": time.time(),
+            })
+            ctx.logger.info(f"Queued {cert_type} generation job {job_id}")
 
-            if not result.get("success", False):
-                return CertificateResponse(
-                    timestamp=int(time.time()),
-                    message=f"Failed to generate export certificate: {result.get('error', 'Unknown error')}",
-                    agent_address=ctx.agent.address,
-                    certificate_id="",
-                    png_filename="",
-                    pdf_filename="",
-                    download_url="",
-                    csv_logged=False,
-                    processed=False,
-                )
+            def _run_export_job(jid: str, etype: str, edata: dict, creq: CertificateRequest) -> None:
+                jtimings: Dict[str, float] = {}
+                job_started = time.monotonic()
+                hlog.generate_start(job_id=jid, cert_no=creq.certificate_no, category=etype)
+                _set_job(jid, {"status": "running", "message": "Generating PDF...", "updated_at": time.time()})
+                try:
+                    with step_timer("generate_pdf", jtimings):
+                        result = generate_export_certificate(etype, edata)
 
-            # Log to Microsoft Graph Excel if configured
-            try:
-                ms_excel_share_url = os.getenv("HCO_EXCEL_SHARE_URL") or os.getenv("EXCEL_SHARE_URL")
-                ms_table_name = os.getenv("HCO_EXCEL_TABLE_NAME") or os.getenv("EXCEL_TABLE_NAME") or "Certificates"
+                    if not result.get("success", False):
+                        reason = result.get("error", "Unknown error")
+                        hlog.generate_failed(job_id=jid, reason=reason, cert_no=creq.certificate_no)
+                        _set_job(jid, {
+                            "status": "failed",
+                            "message": reason,
+                            "updated_at": time.time(),
+                            "timings": jtimings,
+                        })
+                        return
 
-                if ms_excel_share_url:
-                    from microsoft_graph import (
-                        get_access_token,
-                        get_excel_table_column_names,
-                        append_row_to_shared_excel_table,
+                    hlog.generate_step(
+                        job_id=jid,
+                        step="pdf_ready",
+                        cert_id=result.get("certificate_id", ""),
+                        onedrive=bool(result.get("onedrive_web_url")),
                     )
 
-                    token = get_access_token()
-                    uploaded_web_url = result.get("onedrive_web_url")
+                    with step_timer("excel_log", jtimings):
+                        _excel_log_export(result, creq, etype)
 
-                    row_data = {
+                    jtimings["total"] = sum(jtimings.values())
+                    hlog.generate_done(
+                        job_id=jid,
+                        cert_no=creq.certificate_no,
+                        duration_s=time.monotonic() - job_started,
+                        cert_id=result.get("certificate_id", ""),
+                    )
+                    _set_job(jid, {
+                        "status": "done",
+                        "message": f"Export certificate generated for {creq.certificate_no}",
                         "certificate_id": result.get("certificate_id", ""),
-                        "certificate_no": req.certificate_no,
-                        "category": cert_type,
-                        "issue_date": req.issue_date,
-                        "company_reg_no": req.company_reg_no,
-                        "company_name": req.company_name,
-                        "certificate_url": uploaded_web_url,
-                        "created_at": datetime.now().isoformat(),
-                    }
+                        "download_url": result.get("onedrive_web_url") or "",
+                        "updated_at": time.time(),
+                        "timings": jtimings,
+                    })
+                except Exception as exc:
+                    hlog.generate_failed(job_id=jid, reason=str(exc), cert_no=creq.certificate_no)
+                    _set_job(jid, {
+                        "status": "failed",
+                        "message": str(exc),
+                        "updated_at": time.time(),
+                        "timings": jtimings,
+                    })
 
-                    col_names = get_excel_table_column_names(ms_excel_share_url, ms_table_name, token)
-                    if col_names:
-                        values = [row_data.get(name) for name in col_names]
-                    else:
-                        values = [
-                            row_data["certificate_id"],
-                            row_data["certificate_no"],
-                            row_data["issue_date"],
-                            row_data["company_reg_no"],
-                            row_data["company_name"],
-                            row_data.get("certificate_url") or row_data.get("created_at"),
-                        ]
-
-                    append_row_to_shared_excel_table(ms_excel_share_url, ms_table_name, values, token)
-                    ctx.logger.info(f"✅ Appended export certificate row to Excel table '{ms_table_name}'")
-            except Exception as ms_err:
-                ctx.logger.warning(f"Microsoft Graph upload/log skipped for export certificate: {ms_err}")
+            thread = threading.Thread(
+                target=_run_export_job,
+                args=(job_id, cert_type, export_data, req),
+                daemon=True,
+            )
+            thread.start()
+            _gc_jobs()
 
             return CertificateResponse(
                 timestamp=int(time.time()),
-                message=f"Export certificate generated successfully for {req.certificate_no}",
+                message=f"{cert_type} certificate generation started. Poll /generation-status for progress.",
                 agent_address=ctx.agent.address,
-                certificate_id=result.get("certificate_id", ""),
+                certificate_id="",
                 png_filename="",
                 pdf_filename="",
-                download_url=result.get("onedrive_web_url") or "",
-                csv_logged=True,
-                processed=True,
+                download_url="",
+                csv_logged=False,
+                processed=False,
+                job_id=job_id,
+                async_mode=True,
             )
 
-        # Handle Slaughterhouse Certificate (no annex, no GCC logo, different date format)
+        # Handle Slaughterhouse Certificate — async background thread
         if cert_type == "slaughterhouse":
-            ctx.logger.info(f"Generating slaughterhouse certificate: {req.certificate_no}")
+            ctx.logger.info(f"Generating slaughterhouse certificate (async): {req.certificate_no}")
 
             from datetime import timedelta
 
-            # Calculate expiry date based on validity period
             try:
                 issue_dt = datetime.strptime(req.issue_date, '%Y-%m-%d')
             except Exception:
@@ -3120,7 +3255,7 @@ async def generate_certificate_endpoint(ctx: Context, req: CertificateRequest) -
             validity_years = int(req.validity_period) if req.validity_period else 3
             expiry_date = (issue_dt + timedelta(days=365 * validity_years)).strftime('%Y-%m-%d')
 
-            result = generate_slaughterhouse_certificate(
+            slaughter_params = dict(
                 certificate_no=req.certificate_no,
                 company_name=req.company_name,
                 company_reg_no=req.company_reg_no,
@@ -3137,73 +3272,101 @@ async def generate_certificate_endpoint(ctx: Context, req: CertificateRequest) -
                 company_logo=req.company_logo,
             )
 
-            if not result.get("success", False):
-                return CertificateResponse(
-                    timestamp=int(time.time()),
-                    message=f"Failed to generate slaughterhouse certificate: {result.get('error', 'Unknown error')}",
-                    agent_address=ctx.agent.address,
-                    certificate_id="",
-                    png_filename="",
-                    pdf_filename="",
-                    download_url="",
-                    csv_logged=False,
-                    processed=False,
-                )
+            job_id = str(uuid4())
+            _set_job(job_id, {"status": "queued", "message": "Certificate generation queued", "updated_at": time.time()})
+            ctx.logger.info(f"Queued slaughterhouse generation job {job_id}")
 
-            # Log to Microsoft Graph Excel if configured
-            try:
-                ms_excel_share_url = os.getenv("HCO_EXCEL_SHARE_URL") or os.getenv("EXCEL_SHARE_URL")
-                ms_table_name = os.getenv("HCO_EXCEL_TABLE_NAME") or os.getenv("EXCEL_TABLE_NAME") or "Certificates"
+            def _run_slaughterhouse_job(jid: str, params: dict, creq: CertificateRequest) -> None:
+                jtimings: Dict[str, float] = {}
+                job_started = time.monotonic()
+                hlog.generate_start(job_id=jid, cert_no=creq.certificate_no, category="slaughterhouse")
+                _set_job(jid, {"status": "running", "message": "Generating PDF...", "updated_at": time.time()})
+                try:
+                    with step_timer("generate_pdf", jtimings):
+                        result = generate_slaughterhouse_certificate(**params)
 
-                if ms_excel_share_url:
-                    from microsoft_graph import (
-                        get_access_token,
-                        get_excel_table_column_names,
-                        append_row_to_shared_excel_table,
+                    if not result.get("success", False):
+                        reason = result.get("error", "Unknown error")
+                        hlog.generate_failed(job_id=jid, reason=reason, cert_no=creq.certificate_no)
+                        _set_job(jid, {
+                            "status": "failed",
+                            "message": reason,
+                            "updated_at": time.time(),
+                            "timings": jtimings,
+                        })
+                        return
+
+                    hlog.generate_step(
+                        job_id=jid,
+                        step="pdf_ready",
+                        cert_id=result.get("certificate_id", ""),
+                        onedrive=bool(result.get("onedrive_web_url")),
                     )
 
-                    token = get_access_token()
-                    uploaded_web_url = result.get("onedrive_web_url")
+                    with step_timer("excel_log", jtimings):
+                        ms_excel_share_url = os.getenv("HCO_EXCEL_SHARE_URL") or os.getenv("EXCEL_SHARE_URL")
+                        ms_table_name = os.getenv("HCO_EXCEL_TABLE_NAME") or os.getenv("EXCEL_TABLE_NAME") or "Certificates"
+                        if not ms_excel_share_url:
+                            hlog.excel_skipped("HCO_EXCEL_SHARE_URL not configured")
+                        else:
+                            try:
+                                from microsoft_graph import get_access_token, get_excel_table_column_names, append_row_to_shared_excel_table
+                                token = get_access_token()
+                                row_data = {
+                                    "certificate_id": result.get("certificate_id", ""),
+                                    "certificate_no": creq.certificate_no,
+                                    "category": "slaughterhouse",
+                                    "issue_date": creq.issue_date,
+                                    "company_reg_no": creq.company_reg_no,
+                                    "company_name": creq.company_name,
+                                    "certificate_url": result.get("onedrive_web_url"),
+                                    "created_at": datetime.now().isoformat(),
+                                }
+                                col_names = get_excel_table_column_names(ms_excel_share_url, ms_table_name, token)
+                                if col_names:
+                                    values = [row_data.get(name) for name in col_names]
+                                else:
+                                    values = [row_data["certificate_id"], row_data["certificate_no"], row_data["issue_date"], row_data["company_reg_no"], row_data["company_name"], row_data.get("certificate_url") or row_data.get("created_at")]
+                                append_row_to_shared_excel_table(ms_excel_share_url, ms_table_name, values, token)
+                                hlog.excel_append(table=ms_table_name, cert_no=creq.certificate_no, category="slaughterhouse")
+                            except Exception as ms_err:
+                                hlog.warn("EXCEL", "append failed", table=ms_table_name, cert_no=creq.certificate_no, reason=str(ms_err))
 
-                    row_data = {
+                    jtimings["total"] = sum(jtimings.values())
+                    hlog.generate_done(
+                        job_id=jid,
+                        cert_no=creq.certificate_no,
+                        duration_s=time.monotonic() - job_started,
+                        cert_id=result.get("certificate_id", ""),
+                    )
+                    _set_job(jid, {
+                        "status": "done",
+                        "message": f"Slaughterhouse certificate generated for {creq.company_name}",
                         "certificate_id": result.get("certificate_id", ""),
-                        "certificate_no": req.certificate_no,
-                        "category": "slaughterhouse",
-                        "issue_date": req.issue_date,
-                        "company_reg_no": req.company_reg_no,
-                        "company_name": req.company_name,
-                        "certificate_url": uploaded_web_url,
-                        "created_at": datetime.now().isoformat(),
-                    }
+                        "download_url": result.get("onedrive_web_url") or "",
+                        "updated_at": time.time(),
+                        "timings": jtimings,
+                    })
+                except Exception as exc:
+                    hlog.generate_failed(job_id=jid, reason=str(exc), cert_no=creq.certificate_no)
+                    _set_job(jid, {"status": "failed", "message": str(exc), "updated_at": time.time(), "timings": jtimings})
 
-                    col_names = get_excel_table_column_names(ms_excel_share_url, ms_table_name, token)
-                    if col_names:
-                        values = [row_data.get(name) for name in col_names]
-                    else:
-                        values = [
-                            row_data["certificate_id"],
-                            row_data["certificate_no"],
-                            row_data["issue_date"],
-                            row_data["company_reg_no"],
-                            row_data["company_name"],
-                            row_data.get("certificate_url") or row_data.get("created_at"),
-                        ]
-
-                    append_row_to_shared_excel_table(ms_excel_share_url, ms_table_name, values, token)
-                    ctx.logger.info(f"✅ Appended slaughterhouse certificate row to Excel table '{ms_table_name}'")
-            except Exception as ms_err:
-                ctx.logger.warning(f"Microsoft Graph upload/log skipped for slaughterhouse certificate: {ms_err}")
+            thread = threading.Thread(target=_run_slaughterhouse_job, args=(job_id, slaughter_params, req), daemon=True)
+            thread.start()
+            _gc_jobs()
 
             return CertificateResponse(
                 timestamp=int(time.time()),
-                message=f"Slaughterhouse certificate generated successfully for {req.company_name}",
+                message="Slaughterhouse certificate generation started. Poll /generation-status for progress.",
                 agent_address=ctx.agent.address,
-                certificate_id=result.get("certificate_id", ""),
+                certificate_id="",
                 png_filename="",
                 pdf_filename="",
-                download_url=result.get("onedrive_web_url") or "",
-                csv_logged=True,
-                processed=True,
+                download_url="",
+                csv_logged=False,
+                processed=False,
+                job_id=job_id,
+                async_mode=True,
             )
 
         # Generate unique certificate ID for halal certificate
@@ -3347,8 +3510,10 @@ async def generate_certificate_endpoint(ctx: Context, req: CertificateRequest) -
         elif req.au:
             pu_au_text = f"AU: {req.au}"
 
+        # --- Halal/Domestic: offload heavy work to background thread ---
         ctx.logger.info(f"🔍 Calling certificate generator with {len(csv_files) if csv_files else 0} CSV files")
-        result = generate_certificate_with_html_templates(
+
+        gen_params = dict(
             certificate_no=req.certificate_no,
             company_name=req.company_name,
             company_reg_no=req.company_reg_no,
@@ -3367,127 +3532,121 @@ async def generate_certificate_endpoint(ctx: Context, req: CertificateRequest) -
             domestic_logo_1=req.domestic_logo_1,
             domestic_logo_2=req.domestic_logo_2,
         )
-        
-        success = result.get('success', False)
-        
-        if not success:
-            error_msg = result.get('error', 'Unknown error')
-            ctx.logger.error(f"Failed to generate certificate: {error_msg}")
-            return CertificateResponse(
-                timestamp=int(time.time()),
-                message=f"Failed to generate certificate: {error_msg}",
-                agent_address=ctx.agent.address,
-                certificate_id=certificate_id,
-                png_filename="",
-                pdf_filename="",
-                csv_logged=False,
-                processed=False,
-            )
-        
-        # Certificate already saved to database by generate_certificate_with_data
-        # Get the actual certificate_id from the result
-        actual_certificate_id = result.get('certificate_id', certificate_id)
-        db_saved = True  # Database save already handled by the new function
-        
-        # Prepare data for Google Sheets (for backward compatibility)
-        data = {
-            'certificate_id': actual_certificate_id,
-            'certificate_no': req.certificate_no,
-            'company_name': req.company_name,
-            'company_reg_no': req.company_reg_no,
-            'issue_date': req.issue_date
-        }
-        
-        # Save data to Google Sheets (backup) - no local files created with new method
-        sheets_logged = save_to_sheets(data, "", "")
-        
-        if not sheets_logged:
-            ctx.logger.warning("Failed to save data to Google Sheets, but certificate was saved to database")
-            
-        if not db_saved:
-            ctx.logger.error("Failed to save certificate to database")
-        
-        ctx.logger.info(f"Certificate generated successfully: {actual_certificate_id}")
 
-        # Optional: upload to OneDrive and append to Excel via Microsoft Graph app credentials.
-        # This avoids requiring end-user Microsoft login for generation/storage.
-        try:
-            # Prefer HCO_* env vars (new), but also support existing names used in some setups.
-            ms_excel_share_url = os.getenv("HCO_EXCEL_SHARE_URL") or os.getenv("EXCEL_SHARE_URL")
-            ms_table_name = (
-                os.getenv("HCO_EXCEL_TABLE_NAME")
-                or os.getenv("EXCEL_TABLE_NAME")
-                or "Certificates"
-            )
+        job_id = str(uuid4())
+        _set_job(job_id, {"status": "queued", "message": "Certificate generation queued", "updated_at": time.time()})
+        ctx.logger.info(f"Queued {cert_type} generation job {job_id}")
 
-            if ms_excel_share_url:
-                from microsoft_graph import (
-                    get_access_token,
-                    get_excel_table_column_names,
-                    append_row_to_shared_excel_table,
+        def _run_halal_domestic_job(jid: str, params: dict, cid: str, ctype: str, creq: CertificateRequest) -> None:
+            jtimings: Dict[str, float] = {}
+            job_started = time.monotonic()
+            hlog.generate_start(job_id=jid, cert_no=creq.certificate_no, category=ctype)
+            _set_job(jid, {"status": "running", "message": "Generating PDF...", "updated_at": time.time()})
+            try:
+                with step_timer("generate_pdf", jtimings):
+                    result = generate_certificate_with_html_templates(**params)
+
+                if not result.get("success", False):
+                    reason = result.get("error", "Unknown error")
+                    hlog.generate_failed(job_id=jid, reason=reason, cert_no=creq.certificate_no)
+                    _set_job(jid, {
+                        "status": "failed",
+                        "message": reason,
+                        "updated_at": time.time(),
+                        "timings": jtimings,
+                    })
+                    return
+
+                actual_certificate_id = result.get("certificate_id", cid)
+                hlog.generate_step(
+                    job_id=jid,
+                    step="pdf_ready",
+                    cert_id=actual_certificate_id,
+                    onedrive=bool(result.get("onedrive_web_url")),
                 )
 
-                token = get_access_token()
+                with step_timer("sheets_log", jtimings):
+                    try:
+                        save_to_sheets({
+                            "certificate_id": actual_certificate_id,
+                            "certificate_no": creq.certificate_no,
+                            "company_name": creq.company_name,
+                            "company_reg_no": creq.company_reg_no,
+                            "issue_date": creq.issue_date,
+                        }, "", "")
+                    except Exception:
+                        pass
 
-                # Use the OneDrive URL from the generation result (PDF was already uploaded)
-                uploaded_web_url = result.get("onedrive_web_url")
-                if uploaded_web_url:
-                    ctx.logger.info(f"✅ Using OneDrive URL from generation: {uploaded_web_url}")
-                else:
-                    ctx.logger.warning("⚠️  No OneDrive URL in generation result - certificate may not have been uploaded")
+                with step_timer("excel_log", jtimings):
+                    ms_excel_share_url = os.getenv("HCO_EXCEL_SHARE_URL") or os.getenv("EXCEL_SHARE_URL")
+                    ms_table_name = os.getenv("HCO_EXCEL_TABLE_NAME") or os.getenv("EXCEL_TABLE_NAME") or "Certificates"
+                    if not ms_excel_share_url:
+                        hlog.excel_skipped("HCO_EXCEL_SHARE_URL not configured")
+                    else:
+                        try:
+                            from microsoft_graph import get_access_token, get_excel_table_column_names, append_row_to_shared_excel_table
+                            token = get_access_token()
+                            row_data = {
+                                "certificate_id": actual_certificate_id,
+                                "certificate_no": creq.certificate_no,
+                                "category": ctype,
+                                "issue_date": creq.issue_date,
+                                "company_reg_no": creq.company_reg_no,
+                                "company_name": creq.company_name,
+                                "certificate_url": result.get("onedrive_web_url"),
+                                "created_at": datetime.now().isoformat(),
+                                "products_code": result.get("products_code") or "",
+                                "products_name": result.get("products_name") or "",
+                            }
+                            col_names = get_excel_table_column_names(ms_excel_share_url, ms_table_name, token)
+                            if col_names:
+                                values = [row_data.get(name) for name in col_names]
+                            else:
+                                values = [row_data["certificate_id"], row_data["certificate_no"], row_data["issue_date"], row_data["company_reg_no"], row_data["company_name"], row_data.get("certificate_url") or row_data.get("created_at")]
+                            append_row_to_shared_excel_table(ms_excel_share_url, ms_table_name, values, token)
+                            hlog.excel_append(table=ms_table_name, cert_no=creq.certificate_no, category=ctype)
+                        except Exception as ms_err:
+                            hlog.warn("EXCEL", "append failed", table=ms_table_name, cert_no=creq.certificate_no, reason=str(ms_err))
 
-                # Match the row order to the *actual* Excel table columns.
-                row_data = {
+                jtimings["total"] = sum(jtimings.values())
+                hlog.generate_done(
+                    job_id=jid,
+                    cert_no=creq.certificate_no,
+                    duration_s=time.monotonic() - job_started,
+                    cert_id=actual_certificate_id,
+                )
+                _set_job(jid, {
+                    "status": "done",
+                    "message": f"Certificate generated for {creq.certificate_no}",
                     "certificate_id": actual_certificate_id,
-                    "certificate_no": req.certificate_no,
-                    "category": cert_type,
-                    "issue_date": req.issue_date,
-                    "company_reg_no": req.company_reg_no,
-                    "company_name": req.company_name,
-                    "certificate_url": uploaded_web_url,
-                    # Backwards-compatible if your table uses this column name instead:
-                    "created_at": datetime.now().isoformat(),
-                }
+                    "download_url": result.get("onedrive_web_url") or "",
+                    "updated_at": time.time(),
+                    "timings": jtimings,
+                })
+            except Exception as exc:
+                hlog.generate_failed(job_id=jid, reason=str(exc), cert_no=creq.certificate_no)
+                _set_job(jid, {"status": "failed", "message": str(exc), "updated_at": time.time(), "timings": jtimings})
 
-                # Store product code/name lists for product verification (halal_certificate, domestic, etc.).
-                # Required for /certificate/verify-products to work; Excel table must have these columns.
-                row_data["products_code"] = result.get("products_code") or ""
-                row_data["products_name"] = result.get("products_name") or ""
+        thread = threading.Thread(
+            target=_run_halal_domestic_job,
+            args=(job_id, gen_params, certificate_id, cert_type, req),
+            daemon=True,
+        )
+        thread.start()
+        _gc_jobs()
 
-                col_names = get_excel_table_column_names(ms_excel_share_url, ms_table_name, token)
-                if col_names:
-                    values = [row_data.get(name) for name in col_names]
-                else:
-                    values = [
-                        row_data["certificate_id"],
-                        row_data["certificate_no"],
-                        row_data["issue_date"],
-                        row_data["company_reg_no"],
-                        row_data["company_name"],
-                        row_data.get("certificate_url") or row_data.get("created_at"),
-                    ]
-
-                append_row_to_shared_excel_table(ms_excel_share_url, ms_table_name, values, token)
-                ctx.logger.info(f"✅ Appended row to Excel table '{ms_table_name}'")
-            else:
-                ctx.logger.info(
-                    "Microsoft Graph upload disabled (missing HCO_EXCEL_SHARE_URL)."
-                )
-        except Exception as ms_err:
-            ctx.logger.warning(f"Microsoft Graph upload/log skipped due to error: {ms_err}")
-        
         return CertificateResponse(
             timestamp=int(time.time()),
-            message=(
-                f"Certificate generated successfully!"
-            ),
+            message=f"{cert_type} certificate generation started. Poll /generation-status for progress.",
             agent_address=ctx.agent.address,
-            certificate_id=actual_certificate_id,
-            png_filename=result.get('png_filename', ''),
-            pdf_filename=result.get('pdf_filename', ''),
-            download_url=result.get("onedrive_web_url") or "",
-            csv_logged=db_saved,
-            processed=db_saved,
+            certificate_id="",
+            png_filename="",
+            pdf_filename="",
+            download_url="",
+            csv_logged=False,
+            processed=False,
+            job_id=job_id,
+            async_mode=True,
         )
         
     except Exception as e:
@@ -3503,6 +3662,27 @@ async def generate_certificate_endpoint(ctx: Context, req: CertificateRequest) -
             csv_logged=False,
             processed=False,
         )
+
+@agent.on_rest_post("/generation-status", GenerationStatusRequest, GenerationStatusResponse)
+async def generation_status_endpoint(ctx: Context, req: GenerationStatusRequest) -> GenerationStatusResponse:
+    job = _get_job(req.job_id)
+    if not job:
+        return GenerationStatusResponse(
+            timestamp=int(time.time()),
+            job_id=req.job_id,
+            status="not_found",
+            message="No generation job found with this ID",
+        )
+    return GenerationStatusResponse(
+        timestamp=int(time.time()),
+        job_id=req.job_id,
+        status=job.get("status", "unknown"),
+        message=job.get("message", ""),
+        certificate_id=job.get("certificate_id", ""),
+        download_url=job.get("download_url", ""),
+        timings=job.get("timings", {}),
+    )
+
 
 @agent.on_rest_post("/certificate/verify", CertificateVerifyRequest, CertificateVerifyResponse)
 async def verify_certificate_endpoint(ctx: Context, req: CertificateVerifyRequest) -> CertificateVerifyResponse:
@@ -4384,17 +4564,17 @@ agent.include(chat_proto, publish_manifest=True)
 # CORS is handled natively by uagents framework
 
 if __name__ == "__main__":
-    # Initialize CSV file
+    hlog.configure()
+    hlog.info("APP", "boot start")
     initialize_csv()
-    
-    # Initialize PostgreSQL database
+
     try:
         init_database()
+        hlog.info("APP", "database ready")
     except Exception as e:
-        print(f"Warning: Could not initialize database: {e}")
-    
-    # Flask app removed - using only uAgent REST endpoints
-    
+        hlog.warn("APP", "database init failed", reason=str(e))
+
+    hlog.info("APP", "agent listening", port=os.getenv("AGENT_PORT", "8096"))
     agent.run()
 
 

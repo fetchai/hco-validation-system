@@ -63,8 +63,14 @@ secrets/
 credentials.json
 service_account.json
 
+# Auth cache (runtime token storage)
+auth_cache.json
+
 # Generated certificates
 generated_certificates/
+
+# Local fallback storage
+local_storage/
 
 # Logs
 *.log

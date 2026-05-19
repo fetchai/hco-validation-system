@@ -9,6 +9,8 @@ from typing import Any
 import requests
 from openai import OpenAI
 from dotenv import load_dotenv
+
+import hco_logger as hlog
 from excel_client import read_certificates_from_excel, normalize_certificate_no
 
 load_dotenv()
@@ -69,7 +71,7 @@ def _pdf_pages_to_base64_images(pdf_bytes: bytes, max_pages: int = 3, dpi: int =
     try:
         import fitz  # PyMuPDF
     except ImportError:
-        print("PyMuPDF not installed. Install with: pip install PyMuPDF")
+        hlog.warn("VERIFY", "PyMuPDF not installed", hint="pip install PyMuPDF")
         return []
 
     images = []
@@ -84,7 +86,7 @@ def _pdf_pages_to_base64_images(pdf_bytes: bytes, max_pages: int = 3, dpi: int =
             images.append(base64.b64encode(img_bytes).decode("utf-8"))
         doc.close()
     except Exception as e:
-        print(f"Error converting PDF to images: {e}")
+        hlog.warn("VERIFY", "pdf to images failed", reason=str(e))
     return images
 
 
@@ -219,36 +221,35 @@ def extract_certificate_data_from_url(image_url: str = None, image_base64: str =
     except requests.exceptions.Timeout:
         return {"error": "The request timed out. Please try again."}
     except requests.exceptions.RequestException as e:
-        print(f"DEBUG: Request exception: {e}")
+        hlog.warn("VERIFY", "image extract request failed", reason=str(e))
         msg = str(e)
         if any(k in msg for k in [" 429 ", " 500 ", " 502 ", " 503 ", " 504 ", " 529 ", "timed out", "Connection aborted", "Connection reset", "Temporary failure"]):
             return {"error": "Temporary upstream service error. Please try again in a few moments."}
         return {"error": f"API request failed: {e}. Please try again or contact support."}
     except Exception as e:
-        print(f"DEBUG: General exception: {e}")
+        hlog.error("VERIFY", "image extract failed", reason=str(e))
         return {"error": f"Certificate data extraction failed: {str(e)}"}
 
 def extract_certificate_data(image_content: str, mime_type: str) -> dict:
     """Extract certificate data from image or PDF using OpenAI"""
     if OPENAI_API_KEY is None or OPENAI_API_KEY == "your_openai_api_key_here":
         return {"error": "You need to provide an OPENAI_API_KEY environment variable"}
-    
+
     try:
         if _is_pdf_mime(mime_type):
-            print(f"DEBUG: Routing to PDF analysis pipeline (mime: {mime_type})")
             return _analyze_certificate_pdf_with_openai(pdf_b64=image_content)
         return _analyze_certificate_image_with_openai(image_b64=image_content, mime_type=mime_type)
-            
+
     except requests.exceptions.Timeout:
         return {"error": "The request timed out. Please try again."}
     except requests.exceptions.RequestException as e:
-        print(f"DEBUG: Request exception: {e}")
+        hlog.warn("VERIFY", "image extract request failed", reason=str(e))
         msg = str(e)
         if any(k in msg for k in [" 429 ", " 500 ", " 502 ", " 503 ", " 504 ", " 529 ", "timed out", "Connection aborted", "Connection reset", "Temporary failure"]):
             return {"error": "Temporary upstream service error. Please try again in a few moments."}
         return {"error": f"API request failed: {e}. Please try again or contact support."}
     except Exception as e:
-        print(f"DEBUG: General exception: {e}")
+        hlog.error("VERIFY", "image extract failed", reason=str(e))
         return {"error": f"Certificate data extraction failed: {str(e)}"}
 
 def validate_certificate_in_sheets(certificate_data: dict) -> dict:
@@ -257,13 +258,10 @@ def validate_certificate_in_sheets(certificate_data: dict) -> dict:
         return {"valid": False, "reason": "You need to provide an OPENAI_API_KEY environment variable"}
     
     try:
-        # Read data from Excel Online
-        print(f"DEBUG: Reading certificates from Excel Online database")
         sheets_records = read_certificates_from_excel()
-        print(f"DEBUG: Found {len(sheets_records) if sheets_records else 0} records in Excel Online")
-        
+        hlog.info("VERIFY", "excel records loaded", count=len(sheets_records) if sheets_records else 0)
+
         if not sheets_records:
-            print(f"DEBUG: Excel Online validation failed - no records found")
             return {"valid": False, "reason": "Excel Online is empty or inaccessible"}
         
         # Use OpenAI to intelligently compare extracted data with Google Sheets records
@@ -290,7 +288,6 @@ Instructions:
 Be precise and thorough in your comparison of these 4 fields only.
 """
 
-            print(f"DEBUG: Using OpenAI for intelligent certificate comparison")
             response = openai_client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[
@@ -300,22 +297,18 @@ Be precise and thorough in your comparison of these 4 fields only.
                 temperature=0.2,
                 max_tokens=1000
             )
-            
+
             result = response.choices[0].message.content or ""
-            print(f"DEBUG: OpenAI validation response: {result}")
-            
+
             try:
                 validation_result = json.loads(result)
-                print(f"DEBUG: Parsed OpenAI validation result: {validation_result}")
                 return validation_result
             except json.JSONDecodeError:
-                print(f"DEBUG: Failed to parse OpenAI response, falling back to simple validation")
-                # Fallback to simple certificate number matching
+                hlog.warn("VERIFY", "llm response not parseable, using simple match")
                 return simple_sheets_validation(certificate_data, sheets_records)
-                
+
         except Exception as e:
-            print(f"DEBUG: OpenAI validation failed with error: {e}, falling back to simple validation")
-            # Fallback to simple certificate number matching
+            hlog.warn("VERIFY", "llm validation failed, using simple match", reason=str(e))
             return simple_sheets_validation(certificate_data, sheets_records)
         
     except Exception as e:
@@ -331,19 +324,16 @@ def normalize_certificate_no(cert_no: str) -> str:
 def simple_sheets_validation(certificate_data: dict, sheets_records: list) -> dict:
     """Simple fallback validation by certificate number matching"""
     extracted_cert_no = normalize_certificate_no(str(certificate_data.get('certificate_no', '')))
-    print(f"DEBUG: Simple validation - Looking for certificate number: '{extracted_cert_no}'")
-    
+
     for row in sheets_records:
         db_cert_no = normalize_certificate_no(str(row.get('certificate_no', '')))
         if extracted_cert_no and db_cert_no == extracted_cert_no:
-            print(f"DEBUG: Simple validation - MATCH FOUND: '{db_cert_no}' matches '{extracted_cert_no}'")
             return {
-                "valid": True, 
+                "valid": True,
                 "reason": "Certificate number found in database",
                 "matched_record": row
             }
-    
-    print(f"DEBUG: Simple validation - NO MATCH FOUND for certificate number: '{extracted_cert_no}'")
+
     return {"valid": False, "reason": "Certificate not found in database"}
 
 def _validate_extracted_certificate(extracted_data: dict) -> dict:
@@ -363,9 +353,8 @@ def _validate_extracted_certificate(extracted_data: dict) -> dict:
                 "matched_record": verified_data,
             }
     except Exception as e:
-        print(f"DEBUG: verify_certificate unavailable or failed: {e}")
+        hlog.warn("VERIFY", "verify_certificate unavailable", reason=str(e))
 
-    # Fallback to Excel Online sheet comparison
     return validate_certificate_in_sheets(extracted_data)
 
 
@@ -381,68 +370,50 @@ def get_image_analysis(
         is_image = mime_type.startswith("image/")
         is_pdf = _is_pdf_mime(mime_type)
         if item.get("type") == "resource" and (is_image or is_pdf):
-            file_type_label = "PDF" if is_pdf else "image"
-            print(f"DEBUG: Starting certificate extraction from {file_type_label} base64 content")
+            file_type_label = "pdf" if is_pdf else "image"
+            hlog.info("VERIFY", "image extract start", source=file_type_label)
             extracted_data = extract_certificate_data_from_url(
-                image_base64=item.get("contents", ""), 
-                mime_type=mime_type
+                image_base64=item.get("contents", ""),
+                mime_type=mime_type,
             )
-            print(f"DEBUG: Certificate extraction result: {extracted_data}")
-            
             if extracted_data and "error" not in extracted_data:
-                print(f"DEBUG: Starting validation (DB → Excel Graph → Excel Online)")
                 validation_result = _validate_extracted_certificate(extracted_data)
-                print(f"DEBUG: Validation result: {validation_result}")
-            else:
-                print(f"DEBUG: Skipping validation due to extraction error")
             break
         elif item.get("type") == "image_url":
             image_url = item["image_url"]["url"]
             mime_type = item.get("mime_type", "image/jpeg")
-            
-            print(f"DEBUG: Starting certificate extraction from URL: {image_url}")
+            hlog.info("VERIFY", "image extract start", source="url")
             extracted_data = extract_certificate_data_from_url(
-                image_url=image_url, 
-                mime_type=mime_type
+                image_url=image_url,
+                mime_type=mime_type,
             )
-            print(f"DEBUG: Certificate extraction result: {extracted_data}")
-            
             if extracted_data and "error" not in extracted_data:
-                print(f"DEBUG: Starting validation (DB → Excel Graph → Excel Online)")
                 validation_result = _validate_extracted_certificate(extracted_data)
-                print(f"DEBUG: Validation result: {validation_result}")
-            else:
-                print(f"DEBUG: Skipping validation due to extraction error")
             break
-    
+
     if not extracted_data:
         return "No certificate image or PDF found to process."
-    
+
     if "error" in extracted_data:
         error_msg = extracted_data['error']
-        print(f"DEBUG: Error in extraction: {error_msg}")
-        
-        # Provide a helpful fallback message
+        hlog.warn("VERIFY", "image extraction returned error", reason=error_msg)
         if "400 Client Error" in error_msg or "API request failed" in error_msg:
             return f"❌ **Certificate Analysis Failed**\n\nI'm having trouble analyzing this certificate right now. This could be due to:\n\n• Image/PDF format or size issues\n• Temporary API service problems\n• Image quality or resolution\n\nPlease try:\n1. Using a clearer, higher resolution image or PDF\n2. Uploading a different format (JPG, PNG, PDF)\n3. Trying again in a few minutes\n\nFor immediate assistance, contact HCO at info@hcoltd.co.uk or +44 (0) 333 577 0902."
         else:
             return f"Error processing image: {error_msg}"
-    
-    # Format human-friendly response
-    print(f"DEBUG: Final verification decision - Validation result: {validation_result}")
+
     if validation_result and validation_result.get('valid', False):
         company_name = extracted_data.get('company_name', 'Unknown Company')
         issue_date = extracted_data.get('issue_date', 'Unknown Date')
         certificate_no = extracted_data.get('certificate_no', 'Unknown Certificate')
-        
-        print(f"DEBUG: ✅ CERTIFICATE VERIFIED - Company: {company_name}, Date: {issue_date}, Cert No: {certificate_no}")
+        hlog.info("VERIFY", "image result=VERIFIED", cert_no=certificate_no, company=company_name, issue_date=issue_date)
         response = f"✅ **Certificate Verified!**\n\n"
         response += f"This is a valid HCO certificate for **{company_name}**, issued on **{issue_date}**.\n\n"
         response += f"Certificate Number: {certificate_no}"
     else:
         reason = validation_result.get('reason', 'Unknown reason') if validation_result else 'No validation performed'
-        print(f"DEBUG: ❌ CERTIFICATE NOT VERIFIED - Reason: {reason}")
+        hlog.info("VERIFY", "image result=NOT_VERIFIED", reason=reason)
         response = f"❌ **Certificate Not Valid**\n\n"
         response += "This certificate is not valid. If you need a valid HCO certificate, please apply at https://www.hcoltd.co.uk/registration or contact HCO directly for assistance at info@hcoltd.co.uk or +44 (0) 333 577 0902."
-    
+
     return response

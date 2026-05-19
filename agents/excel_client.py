@@ -2,6 +2,9 @@ import requests
 import os
 import json
 
+import hco_logger as hlog
+
+
 class ExcelOnlineClient:
     """Client for Excel on OneDrive with environment-based authentication"""
     
@@ -29,10 +32,10 @@ class ExcelOnlineClient:
                         self.headers = {"Authorization": f"Bearer {access_token}"}
                         return
             
-            print("Warning: No authentication available for Excel operations")
+            hlog.warn("EXCEL", "no auth available")
             self.headers = {}
         except Exception as e:
-            print(f"❌ Error refreshing headers: {e}")
+            hlog.warn("EXCEL", "header refresh failed", reason=str(e))
             self.headers = {}
     
     def _get_drive_id(self, item_id: str):
@@ -49,20 +52,16 @@ class ExcelOnlineClient:
         if response.status_code in [200, 201]:
             self.session_id = response.json().get("id")
             self.headers["workbook-session-id"] = self.session_id
-            print(f"✅ Session created")
         elif response.status_code == 401:
-            print(f"🔄 Session creation failed due to auth, refreshing token...")
             self._refresh_headers()
-            # Retry once with refreshed headers
             response = requests.post(url, headers=self.headers, json=payload)
             if response.status_code in [200, 201]:
                 self.session_id = response.json().get("id")
                 self.headers["workbook-session-id"] = self.session_id
-                print(f"✅ Session created after token refresh")
             else:
-                print(f"⚠️  Session creation failed, continuing without session")
+                hlog.warn("EXCEL", "session creation failed after token refresh", status=response.status_code)
         else:
-            print(f"⚠️  Session creation failed, continuing without session")
+            hlog.warn("EXCEL", "session creation failed", status=response.status_code)
     
     def close_session(self, item_id: str):
         """Close the workbook session"""
@@ -72,7 +71,6 @@ class ExcelOnlineClient:
             requests.post(url, headers=self.headers)
             if "workbook-session-id" in self.headers:
                 del self.headers["workbook-session-id"]
-            print("✅ Session closed")
     
     def list_worksheets(self, item_id: str):
         """List all worksheets"""
@@ -95,15 +93,10 @@ class ExcelOnlineClient:
         if response.status_code == 200:
             tables = response.json().get("value", [])
             if tables:
-                table_name = tables[0].get("name")
-                print(f"✅ Found table: '{table_name}'")
-                return table_name
-            else:
-                print("⚠️  No tables found")
-                return None
-        else:
-            print(f"❌ Error listing tables: {response.status_code}")
+                return tables[0].get("name")
             return None
+        hlog.warn("EXCEL", "list tables failed", status=response.status_code)
+        return None
     
     def create_table(self, item_id: str, worksheet_name: str, range_address: str, table_name: str):
         """Create a table from a range"""
@@ -119,11 +112,10 @@ class ExcelOnlineClient:
         response = requests.post(url, headers=self.headers, json=payload)
         
         if response.status_code in [200, 201]:
-            print(f"✅ Table '{table_name}' created successfully!")
+            hlog.info("EXCEL", "table created", table=table_name)
             return response.json()
-        else:
-            print(f"❌ Error creating table: {response.text}")
-            return None
+        hlog.warn("EXCEL", "table create failed", table=table_name, status=response.status_code)
+        return None
     
     def write_range(self, item_id: str, worksheet_name: str, range_address: str, values: list):
         """Write to a range in worksheet"""
@@ -136,22 +128,17 @@ class ExcelOnlineClient:
         if response.status_code == 200:
             return response.json()
         elif response.status_code == 401:
-            print(f"🔄 Write failed due to auth, refreshing token...")
             self._refresh_headers()
-            # Retry once with refreshed headers
             response = requests.patch(url, headers=self.headers, json=payload)
             if response.status_code == 200:
-                print(f"✅ Write successful after token refresh")
                 return response.json()
-            else:
-                error_msg = f"❌ Error writing range after token refresh: {response.text}"
-                print(error_msg)
-                return None
+            hlog.warn("EXCEL", "write range failed after token refresh", status=response.status_code)
+            return None
         else:
-            error_msg = f"❌ Error writing range: {response.text}"
+            hint = ""
             if "invalidRequest" in response.text and "item ID is not valid" in response.text:
-                error_msg += f"\n💡 Tip: Check that EXCEL_ITEM_ID in .env matches your Excel file and authentication"
-            print(error_msg)
+                hint = "Check EXCEL_ITEM_ID in .env"
+            hlog.warn("EXCEL", "write range failed", status=response.status_code, hint=hint)
             return None
     
     def add_row_to_table(self, item_id: str, table_name: str, row_data: list):
@@ -167,11 +154,9 @@ class ExcelOnlineClient:
         response = requests.post(url, headers=self.headers, json=payload)
         
         if response.status_code in [200, 201]:
-            print("✅ Row added successfully!")
             return response.json()
-        else:
-            print(f"❌ Error adding row: {response.text}")
-            return None
+        hlog.warn("EXCEL", "add row failed", table=table_name, status=response.status_code)
+        return None
 
 
 # ============================================
@@ -182,9 +167,9 @@ def add_data_to_excel(certificate_no: str, issue_date: str, company_reg_no: str,
     """Add certificate data to Excel table"""
     
     CLIENT_ID = os.getenv("AZURE_CLIENT_ID")
-    ITEM_ID = os.getenv("EXCEL_ITEM_ID")
+    ITEM_ID = os.getenv("EXCEL_ITEM_ID", "25ECF3FBB0289968!s4b08826b0ba849d79183a5db4c852dce")
     if not ITEM_ID:
-        print("❌ EXCEL_ITEM_ID is not set in environment. Set it in .env to use Excel operations.")
+        hlog.warn("EXCEL", "EXCEL_ITEM_ID not configured")
         return None
     WORKSHEET_NAME = "Table1"
     TABLE_NAME = "Table1"
@@ -201,41 +186,30 @@ def add_data_to_excel(certificate_no: str, issue_date: str, company_reg_no: str,
         
         # If no table, create one
         if not existing_table:
-            print("\n🔨 Setting up table for first time...")
-            
-            # Write headers
+            hlog.info("EXCEL", "first-time table setup")
             excel.write_range(ITEM_ID, WORKSHEET_NAME, "A1:C1", [
                 ["Name", "Language", "Status"]
             ])
-            
-            # Write initial row
             excel.write_range(ITEM_ID, WORKSHEET_NAME, "A2:C2", [
                 ["Sample", "Python", "Initial"]
             ])
-            
-            # Create table
             result = excel.create_table(ITEM_ID, WORKSHEET_NAME, "A1:C2", TABLE_NAME)
-            
+
             if result:
                 existing_table = TABLE_NAME
             else:
-                print("❌ Failed to create table")
                 excel.close_session(ITEM_ID)
                 return False
-        
-        # Add the new row
-        print(f"➕ Adding: {certificate_no}, {issue_date}, {company_reg_no}, {company_name}")
+
         result = excel.add_row_to_table(ITEM_ID, existing_table, [certificate_no, issue_date, company_reg_no, company_name, certificate_url])
-        
-        # Close session
+        if result is not None:
+            hlog.excel_append(table=existing_table, cert_no=certificate_no)
         excel.close_session(ITEM_ID)
-        
+
         return result is not None
-            
+
     except Exception as e:
-        print(f"❌ Error: {e}")
-        import traceback
-        traceback.print_exc()
+        hlog.error("EXCEL", "add_data_to_excel failed", reason=str(e))
         return False
 
 
@@ -271,16 +245,15 @@ def get_table_rows(item_id: str, table_name: str):
     
     if response.status_code == 200:
         return response.json().get("value", [])
-    else:
-        print(f"❌ Error reading table rows: {response.text}")
-        return []
+    hlog.warn("EXCEL", "read table rows failed", table=table_name, status=response.status_code)
+    return []
 
 def read_certificates_from_excel():
     """Read all certificate records from Excel Online - directly from worksheet cells"""
     from typing import List, Dict
     try:
         if not EXCEL_ITEM_ID:
-            print("Excel not configured (missing EXCEL_ITEM_ID)")
+            hlog.warn("EXCEL", "EXCEL_ITEM_ID not configured")
             return []
         
         excel = get_excel_client()
@@ -323,23 +296,20 @@ def read_certificates_from_excel():
                         "certificate_url": str(row[4]) if len(row) > 4 and row[4] else ""
                     })
             
-            print(f"✅ Read {len(certificates)} certificates from Excel worksheet")
+            hlog.info("EXCEL", "certificates read", count=len(certificates))
             return certificates
-        else:
-            print(f"❌ Error reading from Excel worksheet: {range_response.status_code}")
-            return []
-        
+        hlog.warn("EXCEL", "worksheet read failed", status=range_response.status_code)
+        return []
+
     except Exception as e:
-        print(f"Error reading from Excel: {e}")
-        import traceback
-        traceback.print_exc()
+        hlog.error("EXCEL", "read certificates failed", reason=str(e))
         return []
 
 def write_certificate_to_excel(certificate_data):
     """Write a new certificate record to Excel Online"""
     try:
         if not EXCEL_ITEM_ID:
-            print("Excel not configured (missing EXCEL_ITEM_ID)")
+            hlog.warn("EXCEL", "EXCEL_ITEM_ID not configured")
             return False
         
         excel = get_excel_client()
@@ -358,8 +328,7 @@ def write_certificate_to_excel(certificate_data):
             values = header_data.get("values", [[]])
             header_values = values[0] if values else []
             if not any(str(cell).strip() for cell in header_values if cell):
-                # No headers, write them
-                print("Writing headers to worksheet...")
+                hlog.info("EXCEL", "writing headers to worksheet")
                 excel.write_range(EXCEL_ITEM_ID, EXCEL_WORKSHEET_NAME, "A1:G1", [
                     ["Certificate No", "Issue Date", "Company Reg No", "Company Name", "Certificate URL", "products_code", "products_name"]
                 ])
@@ -395,38 +364,32 @@ def write_certificate_to_excel(certificate_data):
             certificate_data.get('products_name', ''),
         ]
         
-        # Write directly to worksheet cells (now A-G columns)
         range_address = f"A{next_row}:G{next_row}"
-        print(f"Writing to Excel {range_address}: {row_data}")
-        
         result = excel.write_range(EXCEL_ITEM_ID, EXCEL_WORKSHEET_NAME, range_address, [row_data])
-        
+
         if result:
-            print(f"Successfully wrote certificate {certificate_data.get('certificate_no')} to Excel row {next_row}")
-            
-            # Try to ensure the data is part of a table for better functionality
+            hlog.excel_append(
+                table=EXCEL_TABLE_NAME,
+                cert_no=certificate_data.get('certificate_no', ''),
+                row=next_row,
+            )
             try:
-                # Check if table exists, if not create one
                 table_name = excel.get_table_name(EXCEL_ITEM_ID)
                 if not table_name:
-                    # Create table with the current data range (now includes G column)
                     table_range = f"A1:G{next_row}"
                     excel.create_table(EXCEL_ITEM_ID, EXCEL_WORKSHEET_NAME, table_range, EXCEL_TABLE_NAME)
-                    print(f"Created table covering range {table_range}")
             except Exception as table_error:
-                print(f"Note: Could not create/update table, but data was written: {table_error}")
-            
+                hlog.warn("EXCEL", "table create/update skipped", reason=str(table_error))
+
             excel.close_session(EXCEL_ITEM_ID)
             return True
-        else:
-            print("Failed to write to Excel")
-            excel.close_session(EXCEL_ITEM_ID)
-            return False
-            
+
+        hlog.warn("EXCEL", "write failed", cert_no=certificate_data.get('certificate_no', ''))
+        excel.close_session(EXCEL_ITEM_ID)
+        return False
+
     except Exception as e:
-        print(f"Error writing to Excel: {e}")
-        import traceback
-        traceback.print_exc()
+        hlog.error("EXCEL", "write certificate failed", reason=str(e))
         return False
 
 def find_certificate_in_excel(certificate_no: str):
@@ -446,7 +409,7 @@ def find_certificate_in_excel(certificate_no: str):
         return None
         
     except Exception as e:
-        print(f"Error finding certificate in Excel: {e}")
+        hlog.warn("EXCEL", "find certificate failed", reason=str(e))
         return None
 
 def normalize_certificate_no(cert_no: str) -> str:

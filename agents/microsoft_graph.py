@@ -1,9 +1,16 @@
 import base64
 import os
+import time
 from typing import Any, Dict, Optional, List
 from urllib.parse import urlparse, parse_qs, quote
 
 import requests
+
+
+# Transient Graph errors that are safe to retry on idempotent requests.
+_RETRYABLE_STATUSES = {500, 502, 503, 504}
+_MAX_GET_RETRIES = 3
+_RETRY_BASE_DELAY_SECONDS = 1.0
 
 
 GRAPH_TOKEN_URL_TMPL = "https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
@@ -202,66 +209,139 @@ def graph_request(
     json: Any = None,
     data: Any = None,
     headers: Optional[Dict[str, str]] = None,
-    timeout: int = 60,
+    timeout: int = 30,
 ) -> requests.Response:
     hdrs = {"Authorization": f"Bearer {token}"}
     if headers:
         hdrs.update(headers)
-    resp = requests.request(method, url, headers=hdrs, json=json, data=data, timeout=timeout)
+
+    # Only retry idempotent reads. POST/PUT/PATCH/DELETE are not retried to
+    # avoid duplicate writes (e.g. duplicate Excel rows on transient 500s).
+    method_upper = method.upper()
+    is_retryable_method = method_upper in ("GET", "HEAD")
+
+    last_response: Optional[requests.Response] = None
+    last_exc: Optional[Exception] = None
+
+    for attempt in range(_MAX_GET_RETRIES if is_retryable_method else 1):
+        try:
+            resp = requests.request(
+                method, url, headers=hdrs, json=json, data=data, timeout=timeout
+            )
+        except requests.RequestException as e:
+            last_exc = e
+            if not is_retryable_method or attempt == _MAX_GET_RETRIES - 1:
+                raise
+            time.sleep(_RETRY_BASE_DELAY_SECONDS * (2 ** attempt))
+            continue
+
+        last_response = resp
+        if resp.status_code in _RETRYABLE_STATUSES and is_retryable_method and attempt < _MAX_GET_RETRIES - 1:
+            time.sleep(_RETRY_BASE_DELAY_SECONDS * (2 ** attempt))
+            continue
+        break
+
+    if last_response is None:
+        # No response captured (only possible if the loop exited via exception above,
+        # which already re-raises). Re-raise defensively.
+        raise last_exc if last_exc is not None else RuntimeError("Graph request produced no response")
+
     try:
-        resp.raise_for_status()
+        last_response.raise_for_status()
     except requests.HTTPError as e:
         body: Any
         try:
-            body = resp.json()
+            body = last_response.json()
         except Exception:
-            body = resp.text
+            body = last_response.text
         raise requests.HTTPError(
-            f"Microsoft Graph request failed: method={method} url={url} status={resp.status_code} body={body}",
-            response=resp,
+            f"Microsoft Graph request failed: method={method} url={url} status={last_response.status_code} body={body}",
+            response=last_response,
         ) from e
-    return resp
+    return last_response
 
 
 def _search_drive_item_by_filename(drive_id: str, filename: str, token: str) -> Dict[str, Any]:
     """
-    Search a drive for a file by name. Returns the first best match.
+    Locate a file by name in a drive.
+
+    Uses path-based lookup (`/drives/{driveId}/root:/{filename}:`) instead of the
+    `search(q=...)` endpoint, because the latter is backed by SharePoint's
+    Substrate search index, which on personal OneDrive returns intermittent
+    HTTP 500 ("Error Calling Substrate Search") and indexing-lag 404s.
     """
     if not drive_id or not filename:
         raise ValueError("drive_id and filename are required")
-    url = f"{GRAPH_BASE}/drives/{drive_id}/root/search(q='{filename}')?$select=id,name,webUrl,parentReference"
-    resp = graph_request("GET", url, token)
+
+    safe_filename = quote(filename, safe="")
+    path_url = (
+        f"{GRAPH_BASE}/drives/{drive_id}/root:/{safe_filename}"
+        f"?$select=id,name,webUrl,parentReference"
+    )
+    try:
+        resp = graph_request("GET", path_url, token)
+        return resp.json()
+    except requests.HTTPError as e:
+        if getattr(e.response, "status_code", None) != 404:
+            raise
+
+    # File is not at drive root: list root children and match by exact name.
+    children_url = (
+        f"{GRAPH_BASE}/drives/{drive_id}/root/children"
+        f"?$select=id,name,webUrl,parentReference&$top=200"
+    )
+    resp = graph_request("GET", children_url, token)
     data = resp.json() or {}
     items = data.get("value") or []
-    if not items:
-        raise RuntimeError(f"Could not find any file named like '{filename}' in drive '{drive_id}'")
-    # Prefer exact name match
+    target_lower = filename.lower()
     for it in items:
-        if isinstance(it, dict) and (it.get("name") or "").lower() == filename.lower():
+        if isinstance(it, dict) and (it.get("name") or "").lower() == target_lower:
             return it
-    return items[0]
+
+    raise RuntimeError(
+        f"Could not find any file named '{filename}' at the root of drive '{drive_id}'. "
+        f"If the workbook lives inside a folder, set HCO_ONEDRIVE_FOLDER_SHARE_URL to that folder."
+    )
 
 
 def _search_child_item_by_filename(drive_id: str, parent_item_id: str, filename: str, token: str) -> Dict[str, Any]:
     """
-    Search under a specific folder/item for a file by name.
-    Returns the first best match.
+    Locate a file by name under a specific folder/item.
+
+    Uses path-based lookup first, then falls back to listing children. Avoids
+    the unreliable `search(q=...)` endpoint (Substrate search 500s).
     """
     if not drive_id or not parent_item_id or not filename:
         raise ValueError("drive_id, parent_item_id and filename are required")
     parent_item_id = _normalize_drive_item_id(parent_item_id, drive_id)
-    url = f"{GRAPH_BASE}/drives/{drive_id}/items/{parent_item_id}/search(q='{filename}')?$select=id,name,webUrl,parentReference"
-    resp = graph_request("GET", url, token)
+
+    safe_filename = quote(filename, safe="")
+    path_url = (
+        f"{GRAPH_BASE}/drives/{drive_id}/items/{parent_item_id}:/{safe_filename}"
+        f"?$select=id,name,webUrl,parentReference"
+    )
+    try:
+        resp = graph_request("GET", path_url, token)
+        return resp.json()
+    except requests.HTTPError as e:
+        if getattr(e.response, "status_code", None) != 404:
+            raise
+
+    children_url = (
+        f"{GRAPH_BASE}/drives/{drive_id}/items/{parent_item_id}/children"
+        f"?$select=id,name,webUrl,parentReference&$top=200"
+    )
+    resp = graph_request("GET", children_url, token)
     data = resp.json() or {}
     items = data.get("value") or []
-    if not items:
-        raise RuntimeError(
-            f"Could not find any file named like '{filename}' under item '{parent_item_id}' in drive '{drive_id}'"
-        )
+    target_lower = filename.lower()
     for it in items:
-        if isinstance(it, dict) and (it.get("name") or "").lower() == filename.lower():
+        if isinstance(it, dict) and (it.get("name") or "").lower() == target_lower:
             return it
-    return items[0]
+
+    raise RuntimeError(
+        f"Could not find any file named '{filename}' under item '{parent_item_id}' in drive '{drive_id}'"
+    )
 
 
 def _ensure_folder_item_id(drive_item: Dict[str, Any], drive_id: str) -> str:
@@ -279,6 +359,42 @@ def _ensure_folder_item_id(drive_item: Dict[str, Any], drive_id: str) -> str:
     if not parent_id:
         raise RuntimeError(f"DriveItem is not a folder and parentReference.id missing: {drive_item}")
     return parent_id
+
+
+def _resolve_excel_via_configured_folder(filename: str, token: str) -> Optional[Dict[str, Any]]:
+    """
+    Try to locate the Excel workbook inside the OneDrive folder configured via
+    HCO_ONEDRIVE_FOLDER_SHARE_URL / ONEDRIVE_FOLDER_SHARE_URL.
+
+    Used as a reliable fallback when the configured EXCEL_SHARE_URL is an
+    `excel.cloud.microsoft` open link whose docId is not a real driveItem id.
+    Returns the workbook's driveItem on success, or None if no folder URL is
+    configured or the workbook is not found inside it.
+    """
+    folder_share_url = (
+        os.getenv("HCO_ONEDRIVE_FOLDER_SHARE_URL")
+        or os.getenv("ONEDRIVE_FOLDER_SHARE_URL")
+    )
+    if not folder_share_url or not filename:
+        return None
+    try:
+        share_id = share_url_to_share_id(folder_share_url)
+        url = f"{GRAPH_BASE}/shares/{share_id}/driveItem?$select=id,name,webUrl,parentReference,folder,file"
+        folder_item = graph_request("GET", url, token).json()
+    except Exception:
+        return None
+
+    parent = folder_item.get("parentReference") or {}
+    drive_id = parent.get("driveId")
+    if not drive_id:
+        return None
+    folder_item_id = _normalize_drive_item_id(folder_item.get("id"), drive_id)
+    if not folder_item_id:
+        return None
+    try:
+        return _search_child_item_by_filename(drive_id, folder_item_id, filename, token)
+    except Exception:
+        return None
 
 
 def resolve_share_url(share_url: str, token: str) -> Dict[str, Any]:
@@ -319,6 +435,12 @@ def resolve_share_url(share_url: str, token: str) -> Dict[str, Any]:
                         or os.getenv("MS_EXCEL_FILE_NAME")
                     )
                     if excel_filename:
+                        # Prefer resolving via the configured shared folder: it is a real
+                        # share link and avoids root-level path lookups that may 404 when
+                        # the workbook lives inside a subfolder.
+                        folder_hit = _resolve_excel_via_configured_folder(excel_filename, token)
+                        if folder_hit:
+                            return folder_hit
                         return _search_drive_item_by_filename(drive_id, excel_filename, token)
                     # Fall back to treating the URL as a share link.
                     # (Some environments mistakenly pass excel.cloud "open" links where a share link is expected.)
@@ -416,7 +538,7 @@ def upload_bytes_to_shared_folder(
                 token,
                 data=content,
                 headers={"Content-Type": content_type},
-                timeout=120,
+                timeout=60,
             )
             last_err = None
             break
@@ -580,10 +702,15 @@ def get_excel_table_column_names(
                 or os.getenv("MS_EXCEL_FILE_NAME")
             )
             if excel_filename:
-                found = _search_drive_item_by_filename(drive_id, excel_filename, token)
+                # Prefer folder-based lookup over root path lookup.
+                found = (
+                    _resolve_excel_via_configured_folder(excel_filename, token)
+                    or _search_drive_item_by_filename(drive_id, excel_filename, token)
+                )
+                found_drive_id = (found.get("parentReference") or {}).get("driveId") or drive_id
                 found_id = found.get("id")
                 if found_id:
-                    url2 = f"{GRAPH_BASE}/drives/{drive_id}/items/{found_id}/workbook/tables/{table_name}/columns?$select=name"
+                    url2 = f"{GRAPH_BASE}/drives/{found_drive_id}/items/{found_id}/workbook/tables/{table_name}/columns?$select=name"
                     resp2 = graph_request("GET", url2, token)
                     data2 = resp2.json() or {}
                     cols2 = data2.get("value") or []

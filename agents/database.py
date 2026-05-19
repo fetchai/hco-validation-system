@@ -4,9 +4,8 @@ from typing import Optional, Dict, Any
 import base64
 import logging
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Logging is configured globally by hco_logger.configure(); just attach a child logger.
+logger = logging.getLogger("hco.db")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 

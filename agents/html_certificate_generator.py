@@ -8,9 +8,15 @@ import os
 import io
 import base64
 import html
+import time
+import logging
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 from openai import OpenAI
+
+import hco_logger as hlog
+
+_perf = logging.getLogger("hco.perf")
 
 
 _HCO_LOGO_DATA_URI: Optional[str] = None
@@ -47,19 +53,42 @@ def _build_export_logo_html(logo_option: str) -> str:
     return '<img src="enas.webp" alt="ENAS" style="width: 80px; height: auto;" />'
 
 
-def _build_export_signature_block_html(signature_option: str) -> str:
-    opt = (signature_option or "").strip().lower()
-    if opt in ("without", "no", "none", "false", "0"):
-        return ""
+_EXPORT_SIGNERS = (
+    {"name": "Dr. Amer Rashid", "title": "Technical Director", "image": "AmerRashid.jpeg"},
+    {"name": "Dr. Zain Ali Khan", "title": "Certification Manager", "image": "ZainAli.jpeg"},
+)
+_WITHOUT_SIGNATURE_IMAGE = "without-sign.png"
 
-    # Default to "with" when empty.
+
+def _render_export_signature_block(signer: Dict[str, str], use_placeholder: bool) -> str:
+    image_src = _WITHOUT_SIGNATURE_IMAGE if use_placeholder else signer["image"]
     return (
         '<div class="signature-block">'
-        '<img class="signature-img" src="AmerRashid.png" alt="Signature" />'
-        '<div class="signature-name">Dr. Amer Rashid</div>'
-        '<div class="signature-title">Technical Director</div>'
+        f'<img class="signature-img" src="{image_src}" alt="Signature" />'
+        f'<div class="signature-name">{signer["name"]}</div>'
+        f'<div class="signature-title">{signer["title"]}</div>'
         '</div>'
     )
+
+
+def _build_export_signature_blocks_html(signature_option: str) -> tuple[str, str]:
+    """
+    Render the export-certificate signature footer as a (left, right) pair so the
+    layout matches the domestic certificate (one signer per side, export logo in
+    the middle cell).
+
+    Behavior:
+    - "with" (or empty / unrecognized): use real signature images per signer.
+    - "without": still render both signer blocks (name + title), but swap the image
+      source to a blank placeholder so layout stays aligned.
+    """
+    opt = (signature_option or "").strip().lower()
+    use_placeholder = opt in ("without", "no", "none", "false", "0")
+
+    left_signer, right_signer = _EXPORT_SIGNERS
+    left_html = _render_export_signature_block(left_signer, use_placeholder)
+    right_html = _render_export_signature_block(right_signer, use_placeholder)
+    return left_html, right_html
 
 
 def format_date_dmy(date_str: str) -> str:
@@ -241,8 +270,6 @@ def generate_html_certificate(
     else:
         expiry_date_formatted = format_date_dmy(expiry_date)
 
-    # Generate annex pages HTML (needed first to compute total page count)
-    print(f"🔍 About to generate annex pages with {len(products)} products")
     annex_html_pages = generate_annex_pages_html(
         certificate_no, company_name, company_reg_no, issue_date_formatted,
         expiry_date_formatted, standards, products, validity_period=validity_period,
@@ -252,8 +279,6 @@ def generate_html_certificate(
         domestic_logo_1=domestic_logo_1,
         domestic_logo_2=domestic_logo_2,
     )
-    
-    print(f"\U0001F4C4 Generated {len(annex_html_pages)} annex pages")
 
     total_pages_all = 1 + len(annex_html_pages)
 
@@ -279,11 +304,11 @@ def generate_html_certificate(
     cleaned_pages: List[str] = []
     for idx, page in enumerate(all_html_pages):
         if page is None:
-            print(f"⚠️  Warning: HTML page {idx} is None; skipping")
+            hlog.warn("GENERATE", "html page is None", page_index=idx)
             continue
         cleaned_pages.append(str(page))
     all_html_pages = cleaned_pages
-    print(f"📄 Total pages for PDF: {len(all_html_pages)} (1 main + {len(annex_html_pages)} annex)")
+    hlog.info("GENERATE", "html pages built", total=len(all_html_pages), main=1, annex=len(annex_html_pages))
     
     try:
         # Try weasyprint first (preferred method)
@@ -318,14 +343,13 @@ def generate_html_certificate(
                 optimize_images=True
             )
             
-            print(f"Generated PDF using weasyprint: {len(pdf_data)} bytes")
+            hlog.info("GENERATE", "pdf rendered", engine="weasyprint", bytes=len(pdf_data))
             return pdf_data
-            
+
         except ImportError:
-            print("weasyprint not available, trying pdfkit...")
+            hlog.warn("GENERATE", "weasyprint missing, trying pdfkit")
         except Exception as weasyprint_error:
-            print(f"WeasyPrint failed: {weasyprint_error}")
-            print("Trying alternative PDF generation methods...")
+            hlog.warn("GENERATE", "weasyprint failed, trying pdfkit", reason=str(weasyprint_error))
             
         # Fallback to pdfkit if available
         try:
@@ -361,17 +385,14 @@ def generate_html_certificate(
                 except Exception:
                     pass
             
-            print(f"Generated PDF using pdfkit: {len(pdf_data)} bytes")
+            hlog.info("GENERATE", "pdf rendered", engine="pdfkit", bytes=len(pdf_data))
             return pdf_data
-            
+
         except ImportError:
-            print("pdfkit not available either")
-            
-        # Try playwright for PDF generation
+            hlog.warn("GENERATE", "pdfkit missing, trying playwright")
+
         try:
             from playwright.sync_api import sync_playwright
-            
-            print("Using playwright for HTML to PDF conversion...")
             
             # Create combined HTML with all pages
             combined_html = ""
@@ -391,10 +412,7 @@ def generate_html_certificate(
                 with sync_playwright() as p:
                     browser = p.chromium.launch(headless=True)
                     page = browser.new_page()
-                    page.set_content(combined_html, wait_until='networkidle')
-                    
-                    # Wait for any images to load
-                    page.wait_for_timeout(1000)
+                    page.set_content(combined_html, wait_until='load')
                     
                     pdf_data = page.pdf(
                         format='A4',
@@ -404,23 +422,18 @@ def generate_html_certificate(
                     )
                     browser.close()
                 
-                print(f"Generated PDF using playwright: {len(pdf_data)} bytes")
-                
-                # Verify PDF data is valid
                 if pdf_data and len(pdf_data) > 100 and pdf_data.startswith(b'%PDF'):
-                    print("✅ Valid PDF generated")
+                    hlog.info("GENERATE", "pdf rendered", engine="playwright", bytes=len(pdf_data))
                     return pdf_data
-                else:
-                    print("❌ Invalid PDF data generated - falling back to HTML")
-                    
+                hlog.warn("GENERATE", "playwright produced invalid pdf, falling back to html")
+
             except Exception as pdf_error:
-                print(f"Playwright PDF generation failed: {pdf_error}")
-                
+                hlog.warn("GENERATE", "playwright failed", reason=str(pdf_error))
+
         except ImportError:
-            print("Playwright not available")
-        
-        # Fallback: return HTML content and let the caller handle it
-        print("Falling back to HTML output...")
+            hlog.warn("GENERATE", "playwright missing, falling back to html")
+
+        hlog.warn("GENERATE", "pdf rendering unavailable, returning html only")
         combined_html = ""
         for i, html_content in enumerate(all_html_pages):
             if i == 0:
@@ -436,8 +449,7 @@ def generate_html_certificate(
         return combined_html.encode('utf-8')
         
     except Exception as e:
-        print(f"Error in PDF generation: {e}")
-        # Return None to indicate failure instead of HTML content
+        hlog.error("GENERATE", "pdf rendering failed", reason=str(e))
         return None
 
 
@@ -1256,13 +1268,10 @@ def generate_annex_pages_html(
         gcc_logo_html = ""
         sig_cell_width = "50%"
 
-    print(f"🔍 Annex generation - received {len(products)} products")
-    if products:
-        print(f"📋 Sample product: {products[0]}")
-    
     if not products:
-        print("⚠️  No products found - skipping annex generation")
+        hlog.warn("GENERATE", "annex skipped (no products)")
         return []
+    hlog.info("GENERATE", "annex build", products=len(products))
 
     def _extract_product_code_and_name(product: Any) -> tuple[str, str]:
         product_name = ""
@@ -1491,18 +1500,7 @@ def generate_annex_pages_html(
             page_products=page_products,
         )
 
-        print(
-            f"📐 Annex style applied: layout={annex_layout}, total_products={total_products}, "
-            f"page_products={len(page_products)}, cell_fs={table_cell_font_size_px}px, "
-            f"header_fs={table_header_font_size_px}px, pad_y={table_cell_padding_y_px}px, pad_x={table_cell_padding_x_px}px"
-        )
-        
         annex_letter = 'A'  # Always use Annex A for all pages
-
-        print(
-            f"📋 Annex {annex_letter} (Page {page_idx + 1}): Adding {len(page_products)} products "
-            f"(layout={annex_layout}, per_page={products_per_page})"
-        )
 
         product_rows = ""
         products_table_head = ""
@@ -1591,9 +1589,6 @@ def generate_annex_pages_html(
             for i, product in enumerate(page_products):
                 product_number = start_idx + i + 1
                 product_code, product_name = _extract_product_code_and_name(product)
-
-                print(f"Processing product {product_number}: code='{product_code}', name='{product_name}'")
-                print(f"Original product data: {product}")
 
                 product_rows += f"""
             <tr>
@@ -2259,24 +2254,20 @@ def generate_certificate_with_html_templates(
     try:
         # Process CSV files to get products
         products = []
-        print(f"🔍 Processing {len(csv_files) if csv_files else 0} CSV files")
+        if csv_files:
+            hlog.info("GENERATE", "products extract start", files=len(csv_files))
         excel_extracted_name_only = False
         if csv_files:
             for csv_file in csv_files:
                 try:
                     filename = csv_file.filename.lower()
-                    
+
                     if filename.endswith('.xlsx') or filename.endswith('.xls'):
-                        # Handle Excel files using the new generic OpenAI-powered extraction
                         try:
-                            # Get binary content for Excel files
                             content = csv_file.read()
                             if not isinstance(content, bytes):
-                                print(f"Warning: Expected binary content for Excel file, got {type(content)}")
                                 if isinstance(content, str):
                                     content = content.encode('utf-8')
-                            
-                            print(f"Processing Excel file: {csv_file.filename}, content size: {len(content)} bytes")
 
                             def _normalize_excel_name(value: str) -> str:
                                 return ''.join(ch for ch in (value or '').lower() if ch.isalnum())
@@ -2385,51 +2376,54 @@ def generate_certificate_with_html_templates(
                                                 pandas_products.append({
                                                     'product_name': str(row[name_col]).strip(),
                                                 })
-                                else:
-                                    print("⚠️  Pandas: target sheet 'final producsts names' not found; falling back")
                             except ImportError:
-                                print("⚠️  Pandas not installed; falling back to OpenAI extraction")
+                                hlog.warn("GENERATE", "pandas missing, falling back to llm extraction")
                             except Exception as pandas_error:
-                                print(f"⚠️  Pandas Excel parsing failed: {pandas_error}; falling back")
+                                hlog.warn("GENERATE", "pandas extract failed, falling back", reason=str(pandas_error))
 
                             if pandas_products:
                                 products.extend(pandas_products)
                                 excel_extracted_name_only = excel_extracted_name_only or pandas_name_only
-                                print(f"✅ Pandas extracted {len(pandas_products)} products from sheet (name_only={pandas_name_only})")
+                                hlog.info(
+                                    "GENERATE",
+                                    "products extracted",
+                                    source="pandas",
+                                    file=csv_file.filename,
+                                    count=len(pandas_products),
+                                    name_only=pandas_name_only,
+                                )
                                 continue
-                            
-                            # Use the new generic process_files_with_openai function
+
                             from agent import process_files_with_openai
-                            
-                            # Prepare file data for processing
                             file_data = {
                                 'filename': csv_file.filename,
-                                'content': content
+                                'content': content,
                             }
-                            
-                            # Extract products using the new generic method
                             extracted_products = process_files_with_openai([file_data])
-                            
-                            print(f"Extracted {len(extracted_products)} products from {csv_file.filename}")
-                            
-                            # Convert to the expected format
+
+                            valid_count = 0
                             for product in extracted_products:
                                 if 'product_code' in product and 'product_name' in product:
                                     code_str = str(product['product_code']).strip()
                                     name_str = str(product['product_name']).strip()
-                                    
-                                    # Create product dictionary in expected format
-                                    product_dict = {'product_code': code_str, 'product_name': name_str}
-                                    products.append(product_dict)
-                                    print(f"✅ Extracted: {code_str} -> {name_str}")
-                                else:
-                                    print(f"⚠️  Skipping invalid product: {product}")
-                            
-                            print(f"Successfully extracted {len(extracted_products)} products using OpenAI")
-                                    
+                                    products.append({'product_code': code_str, 'product_name': name_str})
+                                    valid_count += 1
+                            hlog.info(
+                                "GENERATE",
+                                "products extracted",
+                                source="llm",
+                                file=csv_file.filename,
+                                count=valid_count,
+                                skipped=len(extracted_products) - valid_count,
+                            )
+
                         except Exception as e:
-                            print(f"Error processing Excel file {csv_file.filename}: {e}")
-                            print("Excel file processing failed, will continue without products")
+                            hlog.warn(
+                                "GENERATE",
+                                "excel extract failed",
+                                file=csv_file.filename,
+                                reason=str(e),
+                            )
                     
                     else:
                         # Handle CSV files
@@ -2467,10 +2461,10 @@ def generate_certificate_with_html_templates(
                                 continue
                         
                         if not success:
-                            print(f"Could not parse CSV file {csv_file.filename} with any delimiter")
-                            
+                            hlog.warn("GENERATE", "csv parse failed", file=csv_file.filename)
+
                 except Exception as e:
-                    print(f"Error processing file {csv_file.filename}: {e}")
+                    hlog.warn("GENERATE", "file processing failed", file=csv_file.filename, reason=str(e))
         
         # Generate certificate ID
         certificate_id = f"{certificate_no}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -2482,11 +2476,11 @@ def generate_certificate_with_html_templates(
         elif au:
             pu_au_text = f"On basis of AU: {au}"
         
-        print(f"📊 Total products processed: {len(products)}")
-        
+        hlog.info("GENERATE", "products total", count=len(products))
+
         # TEMPORARY: Add sample products for testing if no products were extracted
         if len(products) == 0:
-            print("⚠️  No products extracted from files, adding sample products for testing...")
+            hlog.warn("GENERATE", "no products extracted, injecting sample test products")
             sample_products = [
                 {'product_code': 'TEST001', 'product_name': 'Sample Product 1'},
                 {'product_code': 'TEST002', 'product_name': 'Sample Product 2'},
@@ -2498,7 +2492,6 @@ def generate_certificate_with_html_templates(
                 {'product_code': 'TEST008', 'product_name': 'Sample Product 8'},
             ]
             products.extend(sample_products)
-            print(f"✅ Added {len(sample_products)} sample products for testing (will generate {(len(sample_products) + 4) // 5} annex pages)")
         
         # Generate PDF using HTML templates
         pdf_data = generate_html_certificate(
@@ -2526,43 +2519,31 @@ def generate_certificate_with_html_templates(
         final_pdf_data = None
         
         if pdf_data:
-            # Check if we got HTML instead of PDF
             is_pdf = pdf_data.startswith(b'%PDF') if isinstance(pdf_data, bytes) else False
-            
+
             if is_pdf:
                 pdf_generation_success = True
                 final_pdf_data = pdf_data
-                print("✅ PDF generated successfully")
             else:
-                # We got HTML, try to convert it using a simple method
-                print("Got HTML content, attempting alternative PDF generation...")
                 try:
-                    # Set environment variables for library paths
                     import os
                     os.environ['DYLD_LIBRARY_PATH'] = '/opt/homebrew/lib:/usr/local/lib:' + os.environ.get('DYLD_LIBRARY_PATH', '')
-                    
-                    # Try to use weasyprint if available
                     from weasyprint import HTML
                     html_string = pdf_data.decode('utf-8') if isinstance(pdf_data, bytes) else pdf_data
                     final_pdf_data = HTML(string=html_string).write_pdf()
                     pdf_generation_success = True
-                    print(f"✅ Generated PDF using weasyprint fallback: {len(final_pdf_data)} bytes")
+                    hlog.info("GENERATE", "pdf rendered", engine="weasyprint_fallback", bytes=len(final_pdf_data))
                 except (ImportError, Exception) as e:
-                    # PDF generation failed, but we'll still save the certificate metadata
-                    print(f"❌ PDF generation failed: {e}")
-                    print("⚠️  Continuing without PDF - certificate metadata will be saved")
-                    
-                    # Save HTML file for manual conversion
+                    hlog.warn("GENERATE", "pdf fallback failed, continuing without pdf", reason=str(e))
                     html_filename = f"certificate_{certificate_no.replace('/', '_')}.html"
                     try:
                         with open(html_filename, 'wb') as f:
                             f.write(pdf_data)
-                        print(f"📄 Saved HTML file: {html_filename}")
+                        hlog.info("GENERATE", "html saved as fallback", file=html_filename)
                     except Exception as html_error:
-                        print(f"Failed to save HTML file: {html_error}")
+                        hlog.warn("GENERATE", "html fallback save failed", reason=str(html_error))
         else:
-            print("❌ No data returned from PDF generation")
-            print("⚠️  Continuing without PDF - certificate will be uploaded to OneDrive")
+            hlog.warn("GENERATE", "no data from pdf renderer, continuing without pdf")
 
         # Upload to OneDrive instead of database
         pdf_filename = f"certificate_{certificate_no.replace('/', '_')}.pdf"
@@ -2588,19 +2569,18 @@ def generate_certificate_with_html_templates(
                     onedrive_success = True
                     if isinstance(upload_result, dict):
                         try:
-                            # Try to get direct download URL first
                             onedrive_web_url = get_download_url_from_upload_result(upload_result, token)
-                        except Exception as e:
-                            # Fallback to webUrl if download URL fails
+                        except Exception:
                             onedrive_web_url = upload_result.get("webUrl")
-                            print(f"⚠️  Could not get direct download URL, using webUrl: {e}")
-                    print(f"✅ Certificate uploaded to OneDrive: {pdf_filename}")
-                    if onedrive_web_url:
-                        print(f"✅ OneDrive download URL: {onedrive_web_url}")
+                    hlog.onedrive_upload(
+                        file=pdf_filename,
+                        url=onedrive_web_url,
+                        size_bytes=len(final_pdf_data),
+                    )
                 else:
-                    print("⚠️  OneDrive not configured - certificate PDF not uploaded")
+                    hlog.onedrive_skipped("ONEDRIVE_FOLDER_SHARE_URL not configured")
             except Exception as upload_error:
-                print(f"❌ Failed to upload to OneDrive: {upload_error}")
+                hlog.error("ONEDRIVE", "upload failed", file=pdf_filename, reason=str(upload_error))
 
         product_codes = [
             str(p.get("product_code", "")).strip()
@@ -2630,7 +2610,7 @@ def generate_certificate_with_html_templates(
         }
         
     except Exception as e:
-        print(f"Error generating HTML certificate: {e}")
+        hlog.error("GENERATE", "html certificate fatal", reason=str(e))
         return {
             "success": False,
             "error": str(e)
@@ -2648,13 +2628,15 @@ def generate_meat_export_certificate_html(data: Dict[str, Any]) -> str:
         with open(template_path, 'r', encoding='utf-8') as f:
             html_template = f.read()
     except FileNotFoundError:
-        print(f"Template not found at {template_path}, using inline template")
+        hlog.warn("GENERATE", "template not found, using inline", path=template_path)
         # Fallback to inline template if file not found
         html_template = _get_meat_export_template_inline()
 
     # Replace placeholders with actual data
     export_logo_html = _build_export_logo_html(data.get("export_logo_option"))
-    signature_block_html = _build_export_signature_block_html(data.get("export_signature_option"))
+    signature_left_html, signature_right_html = _build_export_signature_blocks_html(
+        data.get("export_signature_option")
+    )
 
     replacements = {
         '{country_of_origin}': data.get('country_of_origin', ''),
@@ -2686,7 +2668,8 @@ def generate_meat_export_certificate_html(data: Dict[str, Any]) -> str:
         '{meat_condition}': data.get('meat_condition', ''),
         '{inspector_name}': data.get('inspector_name', ''),
         '{export_logo_html}': export_logo_html,
-        '{signature_block_html}': signature_block_html,
+        '{signature_block_left_html}': signature_left_html,
+        '{signature_block_right_html}': signature_right_html,
     }
 
     for placeholder, value in replacements.items():
@@ -2706,11 +2689,13 @@ def generate_non_meat_export_certificate_html(data: Dict[str, Any]) -> str:
         with open(template_path, 'r', encoding='utf-8') as f:
             html_template = f.read()
     except FileNotFoundError:
-        print(f"Template not found at {template_path}, using inline template")
+        hlog.warn("GENERATE", "template not found, using inline", path=template_path)
         html_template = _get_non_meat_export_template_inline()
 
     export_logo_html = _build_export_logo_html(data.get("export_logo_option"))
-    signature_block_html = _build_export_signature_block_html(data.get("export_signature_option"))
+    signature_left_html, signature_right_html = _build_export_signature_blocks_html(
+        data.get("export_signature_option")
+    )
 
     # Replace header placeholders
     replacements = {
@@ -2728,7 +2713,8 @@ def generate_non_meat_export_certificate_html(data: Dict[str, Any]) -> str:
         '{page_number}': data.get('page_number', 1),
         '{total_pages}': data.get('total_pages', 1),
         '{export_logo_html}': export_logo_html,
-        '{signature_block_html}': signature_block_html,
+        '{signature_block_left_html}': signature_left_html,
+        '{signature_block_right_html}': signature_right_html,
     }
 
     for placeholder, value in replacements.items():
@@ -3649,13 +3635,12 @@ def generate_slaughterhouse_certificate(
                 optimize_images=True
             )
             pdf_generation_success = True
-            print(f"Generated slaughterhouse certificate PDF using weasyprint: {len(pdf_data)} bytes")
+            hlog.info("GENERATE", "pdf rendered", engine="weasyprint", category="slaughterhouse", bytes=len(pdf_data))
         except ImportError:
-            print("weasyprint not available, trying playwright...")
+            hlog.warn("GENERATE", "weasyprint missing, trying playwright")
         except Exception as e:
-            print(f"WeasyPrint failed: {e}")
+            hlog.warn("GENERATE", "weasyprint failed, trying playwright", reason=str(e))
 
-        # Fallback to playwright
         if not pdf_generation_success:
             try:
                 from playwright.sync_api import sync_playwright
@@ -3663,8 +3648,7 @@ def generate_slaughterhouse_certificate(
                 with sync_playwright() as p:
                     browser = p.chromium.launch(headless=True)
                     page = browser.new_page()
-                    page.set_content(html_content, wait_until='networkidle')
-                    page.wait_for_timeout(1000)
+                    page.set_content(html_content, wait_until='load')
 
                     pdf_data = page.pdf(
                         format='A4',
@@ -3676,15 +3660,15 @@ def generate_slaughterhouse_certificate(
 
                 if pdf_data and len(pdf_data) > 100 and pdf_data.startswith(b'%PDF'):
                     pdf_generation_success = True
-                    print(f"Generated slaughterhouse certificate PDF using playwright: {len(pdf_data)} bytes")
+                    hlog.info("GENERATE", "pdf rendered", engine="playwright", category="slaughterhouse", bytes=len(pdf_data))
             except ImportError:
-                print("Playwright not available")
+                hlog.warn("GENERATE", "playwright missing")
             except Exception as e:
-                print(f"Playwright failed: {e}")
+                hlog.warn("GENERATE", "playwright failed", reason=str(e))
 
         if not pdf_generation_success:
             pdf_data = html_content.encode('utf-8')
-            print("Falling back to HTML output for slaughterhouse certificate")
+            hlog.warn("GENERATE", "slaughterhouse falling back to html only")
 
         # Generate certificate ID
         certificate_id = f"{certificate_no}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -3725,9 +3709,16 @@ def generate_slaughterhouse_certificate(
                             onedrive_web_url = get_download_url_from_upload_result(upload_result, token)
                         except Exception:
                             onedrive_web_url = upload_result.get("webUrl")
-                    print(f"Slaughterhouse certificate uploaded to OneDrive: {upload_filename}")
+                    hlog.onedrive_upload(
+                        file=upload_filename,
+                        url=onedrive_web_url,
+                        size_bytes=len(upload_content),
+                        category="slaughterhouse",
+                    )
+                else:
+                    hlog.onedrive_skipped("ONEDRIVE_FOLDER_SHARE_URL not configured")
             except Exception as e:
-                print(f"Failed to upload slaughterhouse certificate to OneDrive: {e}")
+                hlog.error("ONEDRIVE", "upload failed", file=upload_filename, reason=str(e))
 
         return {
             "success": True,
@@ -3743,9 +3734,7 @@ def generate_slaughterhouse_certificate(
         }
 
     except Exception as e:
-        print(f"Error generating slaughterhouse certificate: {e}")
-        import traceback
-        traceback.print_exc()
+        hlog.error("GENERATE", "slaughterhouse fatal", reason=str(e))
         return {
             "success": False,
             "error": str(e)
@@ -3768,8 +3757,12 @@ def generate_export_certificate(
     """
     from datetime import datetime
 
+    step_times: Dict[str, float] = {}
+    t_total = time.monotonic()
+
     try:
-        # Generate HTML based on certificate type
+        # ---- 1. Build HTML pages ----
+        t0 = time.monotonic()
         html_pages: List[str] = []
         if certificate_type == 'export_meat':
             html_pages = [generate_meat_export_certificate_html(data)]
@@ -3791,7 +3784,7 @@ def generate_export_certificate(
         else:
             return {"success": False, "error": f"Unknown certificate type: {certificate_type}"}
 
-        # Combine pages into single HTML document with page breaks (WeasyPrint-friendly)
+        import re as _re
         html_content = ""
         for i, page_html in enumerate(html_pages):
             if not page_html:
@@ -3799,34 +3792,34 @@ def generate_export_certificate(
             if i == 0:
                 html_content += page_html
             else:
-                import re
-                body_match = re.search(r'<body[^>]*>(.*?)</body>', page_html, re.DOTALL)
+                body_match = _re.search(r'<body[^>]*>(.*?)</body>', page_html, _re.DOTALL)
                 if body_match:
                     body_content = body_match.group(1)
                     html_content += f'<div style="page-break-before: always;">{body_content}</div>'
+        step_times["html_build"] = time.monotonic() - t0
+        _perf.info("EXPORT html_build=%.2fs pages=%d", step_times["html_build"], len(html_pages))
 
-        # Convert HTML to PDF
+        # ---- 2. Convert HTML → PDF ----
+        t0 = time.monotonic()
         pdf_data = None
         pdf_generation_success = False
 
-        # Try weasyprint first
         try:
             os.environ['DYLD_LIBRARY_PATH'] = '/opt/homebrew/lib:/usr/local/lib:' + os.environ.get('DYLD_LIBRARY_PATH', '')
             os.environ['PKG_CONFIG_PATH'] = '/opt/homebrew/lib/pkgconfig:/usr/local/lib/pkgconfig:' + os.environ.get('PKG_CONFIG_PATH', '')
 
-            from weasyprint import HTML
-            pdf_data = HTML(string=html_content, base_url=os.path.dirname(__file__)).write_pdf(
+            from weasyprint import HTML as _WeasyHTML
+            pdf_data = _WeasyHTML(string=html_content, base_url=os.path.dirname(__file__)).write_pdf(
                 presentational_hints=True,
                 optimize_images=True
             )
             pdf_generation_success = True
-            print(f"Generated export certificate PDF using weasyprint: {len(pdf_data)} bytes")
+            _perf.info("weasyprint OK bytes=%d", len(pdf_data))
         except ImportError:
-            print("weasyprint not available, trying playwright...")
+            _perf.info("weasyprint not available, trying playwright")
         except Exception as e:
-            print(f"WeasyPrint failed: {e}")
+            _perf.warning("WeasyPrint failed: %s", e)
 
-        # Fallback to playwright
         if not pdf_generation_success:
             try:
                 from playwright.sync_api import sync_playwright
@@ -3834,8 +3827,7 @@ def generate_export_certificate(
                 with sync_playwright() as p:
                     browser = p.chromium.launch(headless=True)
                     page = browser.new_page()
-                    page.set_content(html_content, wait_until='networkidle')
-                    page.wait_for_timeout(1000)
+                    page.set_content(html_content, wait_until='load')
 
                     pdf_data = page.pdf(
                         format='A4',
@@ -3847,21 +3839,23 @@ def generate_export_certificate(
 
                 if pdf_data and len(pdf_data) > 100 and pdf_data.startswith(b'%PDF'):
                     pdf_generation_success = True
-                    print(f"Generated export certificate PDF using playwright: {len(pdf_data)} bytes")
+                    _perf.info("playwright OK bytes=%d", len(pdf_data))
             except ImportError:
-                print("Playwright not available")
+                _perf.info("Playwright not available")
             except Exception as e:
-                print(f"Playwright failed: {e}")
+                _perf.warning("Playwright failed: %s", e)
 
         if not pdf_generation_success:
-            # Return HTML as fallback
             pdf_data = html_content.encode('utf-8')
-            print("Falling back to HTML output for export certificate")
+            _perf.info("Falling back to HTML output")
 
-        # Generate certificate ID
+        step_times["pdf_render"] = time.monotonic() - t0
+        _perf.info("EXPORT pdf_render=%.2fs success=%s", step_times["pdf_render"], pdf_generation_success)
+
+        # ---- 3. Upload to OneDrive ----
+        t0 = time.monotonic()
         certificate_id = f"{data.get('certificate_no', 'EXPORT')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
-        # Upload to OneDrive
         pdf_filename = f"certificate_{data.get('certificate_no', 'export').replace('/', '_')}.pdf"
         onedrive_success = False
         onedrive_web_url = None
@@ -3870,7 +3864,6 @@ def generate_export_certificate(
         upload_content_type = "application/pdf"
         upload_content = pdf_data
 
-        # If PDF generation failed, we still upload the HTML fallback for traceability.
         if not pdf_generation_success:
             upload_filename = f"certificate_{data.get('certificate_no', 'export').replace('/', '_')}.html"
             upload_content_type = "text/html"
@@ -3896,9 +3889,64 @@ def generate_export_certificate(
                             onedrive_web_url = get_download_url_from_upload_result(upload_result, token)
                         except Exception:
                             onedrive_web_url = upload_result.get("webUrl")
-                    print(f"Export certificate uploaded to OneDrive: {upload_filename}")
+                    hlog.onedrive_upload(
+                        file=upload_filename,
+                        url=onedrive_web_url,
+                        size_bytes=len(upload_content),
+                        category=certificate_type,
+                    )
+                else:
+                    hlog.onedrive_skipped("ONEDRIVE_FOLDER_SHARE_URL not configured")
             except Exception as e:
-                print(f"Failed to upload export certificate to OneDrive: {e}")
+                hlog.error("ONEDRIVE", "upload failed", file=upload_filename, reason=str(e))
+
+        step_times["onedrive_upload"] = time.monotonic() - t0
+        step_times["total"] = time.monotonic() - t_total
+        _perf.info("EXPORT COMPLETE type=%s timings=%s", certificate_type, step_times)
+
+        # Aggregate products into comma-separated strings for parity with the
+        # domestic generator result. Only export_non_meat carries a products list
+        # today; export_meat returns empty strings here.
+        products_code_csv = ""
+        products_name_csv = ""
+        if certificate_type == 'export_non_meat':
+            _code_keys = ("product_code", "productcode", "code", "Product Code", "ProductCode")
+            _name_keys = (
+                "description",
+                "product_name",
+                "productname",
+                "Product Name",
+                "ProductName",
+                "Description",
+            )
+            _codes: List[str] = []
+            _names: List[str] = []
+            _seen_codes: set = set()
+            _seen_names: set = set()
+            for _item in (data.get('products') or []):
+                if not isinstance(_item, dict):
+                    continue
+                _lower = {str(k).strip().lower(): v for k, v in _item.items()}
+                _code = ""
+                for k in _code_keys:
+                    v = _lower.get(k.lower())
+                    if v is not None and str(v).strip():
+                        _code = str(v).strip()
+                        break
+                _name = ""
+                for k in _name_keys:
+                    v = _lower.get(k.lower())
+                    if v is not None and str(v).strip():
+                        _name = str(v).strip()
+                        break
+                if _code and _code not in _seen_codes:
+                    _codes.append(_code)
+                    _seen_codes.add(_code)
+                if _name and _name not in _seen_names:
+                    _names.append(_name)
+                    _seen_names.add(_name)
+            products_code_csv = ",".join(_codes)
+            products_name_csv = ",".join(_names)
 
         return {
             "success": True,
@@ -3910,14 +3958,17 @@ def generate_export_certificate(
             "pdf_uploaded": onedrive_success,
             "pdf_bytes": pdf_data if pdf_generation_success else None,
             "onedrive_web_url": onedrive_web_url,
-            "message": f"Export certificate generated. PDF: {'Generated and uploaded' if (pdf_generation_success and onedrive_success) else 'Failed or not uploaded'}"
+            "products_code": products_code_csv,
+            "products_name": products_name_csv,
+            "message": f"Export certificate generated. PDF: {'Generated and uploaded' if (pdf_generation_success and onedrive_success) else 'Failed or not uploaded'}",
+            "timings": step_times,
         }
 
     except Exception as e:
-        print(f"Error generating export certificate: {e}")
-        import traceback
-        traceback.print_exc()
+        step_times["total"] = time.monotonic() - t_total
+        _perf.exception("Error generating export certificate: %s timings=%s", e, step_times)
         return {
             "success": False,
-            "error": str(e)
+            "error": str(e),
+            "timings": step_times,
         }
